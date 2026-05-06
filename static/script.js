@@ -65,12 +65,16 @@ function initTerminal() {
     term = new Terminal({
         cursorBlink: true,
         fontSize: 14,
-        fontFamily: 'monospace',
+        fontFamily: 'Consolas, Monaco, "Courier New", monospace',
+        fontWeight: 'normal',
+        letterSpacing: 0,
+        lineHeight: 1.0,
         theme: {
             background: '#1e1e1e',
             foreground: '#ffffff',
             cursor: '#ffffff'
-        }
+        },
+        convertEol: true
     });
     
     fitAddon = new FitAddon.FitAddon();
@@ -123,6 +127,7 @@ function initTerminal() {
     // Отправляем начальный размер
     setTimeout(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
+            fitAddon.fit();
             ws.send(JSON.stringify({
                 resize: {
                     rows: term.rows,
@@ -130,7 +135,7 @@ function initTerminal() {
                 }
             }));
         }
-    }, 100);
+    }, 200);
 }
 
 function disconnect() {

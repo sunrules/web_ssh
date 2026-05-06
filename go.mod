@@ -1,4 +1,4 @@
-module web-ssh-client
+module web_ssh
 
 go 1.26.2
 
