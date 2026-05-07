@@ -1,25 +1,23 @@
 [Unit]
 Description=WebSSH — Web-based SSH client with WebSocket terminal
-Documentation=https://github.com/webssh
 After=network.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
-WorkingDirectory=/opt/webssh
-ExecStart=/opt/webssh/webssh -p 3400
-ExecReload=/bin/kill -HUP $MAINPID
+User=vmorozov
+Group=vmorozov
+WorkingDirectory=/home/vmorozov/DEV/web_ssh-main
+ExecStart=/home/vmorozov/DEV/web_ssh-main/webssh -p 3400
 Restart=on-failure
 RestartSec=5
-LimitNOFILE=65536
 
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-ReadWritePaths=/opt/webssh
+# Эти строки можно добавить для минимальной безопасности, но они не должны вызывать 226:
+PrivateTmp=no
+PrivateNetwork=no
+ProtectSystem=no
+ProtectHome=no
+NoNewPrivileges=no
+DynamicUser=no
 
 [Install]
 WantedBy=multi-user.target

@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -67,8 +68,8 @@ var (
 	knownHosts   ssh.HostKeyCallback
 )
 
-func loadAccessConfig() error {
-	file, err := os.ReadFile("access.json")
+func loadAccessConfig(path string) error {
+	file, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
@@ -421,6 +422,14 @@ func main() {
 
 	debugMode = *flagDebug
 
+	// Определяем директорию, в которой находится исполняемый файл
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Fatalf("Cannot get executable path: %v", err)
+	}
+	baseDir := filepath.Dir(exePath)
+	log.Printf("Base directory: %s", baseDir)
+
 	if *flagKey != "" {
 		hostKeyCallback, err := knownhosts.New(*flagKey)
 		if err != nil {
@@ -438,18 +447,20 @@ func main() {
 	}
 
 	if debugMode {
-		logFile, err := os.OpenFile("debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		logFilePath := filepath.Join(baseDir, "debug.log")
+		logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			log.Printf("Warning: Could not create debug.log: %v", err)
 		} else {
 			debugLog = log.New(logFile, "[DEBUG] ", log.Ldate|log.Ltime)
 			debugLog.Println("Debug mode enabled")
 			log.SetOutput(io.MultiWriter(os.Stdout, logFile))
-			log.Printf("Debug logging to debug.log enabled")
+			log.Printf("Debug logging to %s enabled", logFilePath)
 		}
 	}
 
-	if err := loadAccessConfig(); err != nil {
+	accessPath := filepath.Join(baseDir, "access.json")
+	if err := loadAccessConfig(accessPath); err != nil {
 		log.Printf("Warning: Could not load access.json: %v", err)
 		accessConfig = AccessConfig{AllowedIPs: []string{"*"}}
 	} else {
@@ -458,23 +469,31 @@ func main() {
 
 	http.HandleFunc("/", securityMiddleware(ipMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			http.ServeFile(w, r, "static/index.html")
+			http.ServeFile(w, r, filepath.Join(baseDir, "static", "index.html"))
 			return
 		}
-		// Safe path: reject any with ".." or absolute paths
-		if strings.Contains(r.URL.Path, "..") || strings.HasPrefix(r.URL.Path, "/") == false {
+		// Защита от path traversal
+		if strings.Contains(r.URL.Path, "..") || !strings.HasPrefix(r.URL.Path, "/") {
 			http.NotFound(w, r)
 			return
 		}
-		http.ServeFile(w, r, "static"+r.URL.Path)
+		rel := strings.TrimPrefix(r.URL.Path, "/")
+		fullPath := filepath.Join(baseDir, "static", rel)
+		// Дополнительная проверка, чтобы не выйти за пределы static/
+		staticDir := filepath.Join(baseDir, "static")
+		if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(staticDir)) {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, fullPath)
 	})))
 
 	http.HandleFunc("/ws", securityMiddleware(ipMiddleware(handleWebSocket)))
 
 	port := fmt.Sprintf(":%d", *flagPort)
 
-	certFile := "cert.pem"
-	keyFile := "key.pem"
+	certFile := filepath.Join(baseDir, "cert.pem")
+	keyFile := filepath.Join(baseDir, "key.pem")
 
 	certExists := false
 	if _, err := os.Stat(certFile); err == nil {
@@ -487,8 +506,8 @@ func main() {
 	}
 
 	tlsConfig := &tls.Config{
-		MinVersion:               tls.VersionTLS12,
-		MaxVersion:               tls.VersionTLS13,
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS13,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
