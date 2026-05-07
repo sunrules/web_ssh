@@ -12,6 +12,8 @@ debug.log
 access.json
 
 # IDE
+.gitignore
 .vscode/
 .idea/
 .clerules/
+.clinerules/cline-config.md
