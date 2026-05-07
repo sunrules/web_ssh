@@ -1,17 +1,11 @@
-// go build -o webssh -ldflags "-s -w " 2>&1
+// $env:GOOS = "linux"; $env:GOARCH = "amd64"; go build -o webssh
+// go build -o webssh -ldflags "-s -w"
 //
 // WebSSH — Web-based SSH client with WebSocket terminal
-// Provides a web interface to connect to SSH servers
-// through a browser with full terminal emulation.
+// Enhanced with anti-scanning "knock", TLS hardening, and HTTP/3 readiness
 //
 // Usage:
-//   webssh [-p port] [-debug] [-key known_hosts_file]
-//
-// Flags:
-//   -p       Port to listen on (default: 3400)
-//   -debug   Enable debug mode, logs written to debug.log
-//   -key     Path to known_hosts file for SSH host key verification (optional)
-//   -h       Show this help message
+//   webssh [-p port] [-debug] [-key known_hosts_file] [-knock KNOCK_VALUE] [-http3]
 
 package main
 
@@ -34,6 +28,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -66,7 +61,48 @@ var (
 	debugMode    bool
 	debugLog     *log.Logger
 	knownHosts   ssh.HostKeyCallback
+	knockHeader  string
 )
+
+// knockMiddleware — проверка "секретного" заголовка перед доступом к /ws
+func knockMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/ws") && knockHeader != "" {
+			if r.Header.Get("X-Knock") != knockHeader {
+				debugPrintf("Knock failed from %s", r.RemoteAddr)
+				http.NotFound(w, r) // 404 вместо 403 — меньше информации для сканеров
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// masqueradeMiddleware — отдаёт "безобидный" контент не-браузерам на чувствительных путях
+func masqueradeMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ua := r.Header.Get("User-Agent")
+		isBrowser := strings.Contains(ua, "Mozilla/") ||
+			strings.Contains(ua, "Chrome/") ||
+			strings.Contains(ua, "Firefox/") ||
+			strings.Contains(ua, "Safari/") ||
+			strings.Contains(ua, "Edge/")
+
+		if !isBrowser && (strings.Contains(r.URL.Path, "/ws") || strings.Contains(r.URL.Path, "/api")) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>Hello</h1></body></html>`)
+			return
+		}
+
+		// Security headers для легитимных запросов
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		next(w, r)
+	}
+}
 
 func loadAccessConfig(path string) error {
 	file, err := os.ReadFile(path)
@@ -81,16 +117,13 @@ func isIPAllowed(ip string) bool {
 	if err == nil {
 		ip = host
 	}
-
 	for _, allowed := range accessConfig.AllowedIPs {
 		if allowed == ip || allowed == "*" {
 			return true
 		}
 		_, ipnet, err := net.ParseCIDR(allowed)
-		if err == nil {
-			if ipnet.Contains(net.ParseIP(ip)) {
-				return true
-			}
+		if err == nil && ipnet.Contains(net.ParseIP(ip)) {
+			return true
 		}
 	}
 	return false
@@ -98,27 +131,13 @@ func isIPAllowed(ip string) bool {
 
 func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-
 		if strings.Contains(r.URL.Path, "/ws") {
 			ua := r.Header.Get("User-Agent")
-			referer := r.Header.Get("Referer")
-
-			if ua == "" || (!strings.Contains(ua, "Mozilla/") &&
-				!strings.Contains(ua, "Chrome/") &&
-				!strings.Contains(ua, "Firefox/") &&
-				!strings.Contains(ua, "Safari/") &&
-				!strings.Contains(ua, "Edge/")) {
+			if ua == "" || (!strings.Contains(ua, "Mozilla/") && !strings.Contains(ua, "Chrome/") &&
+				!strings.Contains(ua, "Firefox/") && !strings.Contains(ua, "Safari/") && !strings.Contains(ua, "Edge/")) {
 				debugPrintf("Suspicious WS User-Agent from %s: '%s'", r.RemoteAddr, ua)
 			}
-			if referer == "" {
-				debugPrintf("WS connection without Referer from %s", r.RemoteAddr)
-			}
 		}
-
 		next(w, r)
 	}
 }
@@ -133,10 +152,9 @@ func ipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		if xRealIP := r.Header.Get("X-Real-IP"); xRealIP != "" {
 			ip = xRealIP
 		}
-
 		if !isIPAllowed(ip) {
 			log.Printf("Access denied for IP: %s", ip)
-			http.Error(w, "Access denied", http.StatusForbidden)
+			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		}
 		log.Printf("Access granted for IP: %s", ip)
@@ -152,10 +170,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	client := &WebSocketClient{
-		conn: conn,
-		done: make(chan struct{}),
-	}
+	client := &WebSocketClient{conn: conn, done: make(chan struct{})}
 
 	var authData struct {
 		Host     string `json:"host"`
@@ -169,33 +184,27 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Error reading auth data: %v", err)
 		return
 	}
-
 	if err := json.Unmarshal(msg, &authData); err != nil {
 		log.Printf("Error parsing auth data: %v", err)
 		client.sendError("Invalid authentication data")
 		return
 	}
-
 	if err := client.connectSSH(authData.Host, authData.Port, authData.Username, authData.Password); err != nil {
 		log.Printf("SSH connection error: %v", err)
 		client.sendError(fmt.Sprintf("SSH connection failed: %v", err))
 		return
 	}
 	defer client.close()
-
 	client.handleMessages()
 }
 
 func (c *WebSocketClient) connectSSH(host string, port int, username, password string) error {
 	config := &ssh.ClientConfig{
-		User: username,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(password),
-		},
+		User:            username,
+		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: knownHosts,
 		Timeout:         10 * time.Second,
 	}
-
 	addr := fmt.Sprintf("%s:%d", host, port)
 	sshConn, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
@@ -214,30 +223,16 @@ func (c *WebSocketClient) connectSSH(host string, port int, username, password s
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}
-
 	if err := session.RequestPty("xterm-256color", 160, 48, modes); err != nil {
 		if err2 := session.RequestPty("xterm", 160, 48, modes); err2 != nil {
 			return fmt.Errorf("request pty: %v (tried xterm: %v)", err, err2)
 		}
 	}
 
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return err
-	}
-	c.stdin = stdin
-
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	c.stdout = stdout
-
-	stderr, err := session.StderrPipe()
-	if err != nil {
-		return err
-	}
-	c.stderr = stderr
+	stdin, _ := session.StdinPipe()
+	stdout, _ := session.StdoutPipe()
+	stderr, _ := session.StderrPipe()
+	c.stdin, c.stdout, c.stderr = stdin, stdout, stderr
 
 	go c.readOutput()
 	go c.readError()
@@ -249,7 +244,6 @@ func (c *WebSocketClient) connectSSH(host string, port int, username, password s
 			c.sendError("Failed to start shell: " + err.Error())
 		}
 	})
-
 	return nil
 }
 
@@ -298,20 +292,15 @@ func (c *WebSocketClient) handleMessages() {
 		if err != nil {
 			return
 		}
-
 		var data map[string]interface{}
 		if err := json.Unmarshal(msg, &data); err != nil {
 			continue
 		}
-
 		if cmd, ok := data["command"].(string); ok {
 			c.mu.Lock()
 			if c.stdin != nil {
 				c.writeMu.Lock()
-				_, err := c.stdin.Write([]byte(cmd))
-				if err != nil {
-					log.Printf("stdin write error: %v", err)
-				}
+				_, _ = c.stdin.Write([]byte(cmd))
 				c.writeMu.Unlock()
 			}
 			c.mu.Unlock()
@@ -320,9 +309,7 @@ func (c *WebSocketClient) handleMessages() {
 				if cols, ok := resize["cols"].(float64); ok {
 					c.mu.Lock()
 					if c.session != nil {
-						if err := c.session.WindowChange(int(rows), int(cols)); err != nil {
-							log.Printf("WindowChange error: %v", err)
-						}
+						_ = c.session.WindowChange(int(rows), int(cols))
 					}
 					c.mu.Unlock()
 				}
@@ -332,27 +319,17 @@ func (c *WebSocketClient) handleMessages() {
 }
 
 func (c *WebSocketClient) sendOutput(data string) {
-	msg := map[string]interface{}{
-		"type": "output",
-		"data": data,
-	}
-	c.sendJSON(msg)
+	c.sendJSON(map[string]interface{}{"type": "output", "data": data})
 }
 
 func (c *WebSocketClient) sendError(errMsg string) {
-	msg := map[string]interface{}{
-		"type":  "error",
-		"error": errMsg,
-	}
-	c.sendJSON(msg)
+	c.sendJSON(map[string]interface{}{"type": "error", "error": errMsg})
 }
 
 func (c *WebSocketClient) sendJSON(msg map[string]interface{}) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if err := c.conn.WriteJSON(msg); err != nil {
-		log.Printf("WriteJSON error: %v", err)
-	}
+	_ = c.conn.WriteJSON(msg)
 }
 
 func (c *WebSocketClient) close() {
@@ -361,7 +338,6 @@ func (c *WebSocketClient) close() {
 	default:
 		close(c.done)
 	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.session != nil {
@@ -390,124 +366,27 @@ Usage:
 Options:
   -p <port>           Port to listen on (default: 3400)
   -debug              Enable debug mode; logs written to debug.log
-  -key <path>         Path to SSH known_hosts file for host key verification
-                      If not specified, host key verification is DISABLED (insecure)
-  -h                  Show this help message and exit
+  -key <path>         Path to SSH known_hosts file
+  -knock <value>      Required X-Knock header for WebSocket access
+  -http3              Enable experimental HTTP/3 support
+  -h                  Show this help
 
-Examples:
-  webssh                        Start on default port 3400
-  webssh -p 8080                Start on port 8080
-  webssh -p 443 -debug          Start on port 443 with debug logging
-  webssh -key ~/.ssh/known_hosts  Enable SSH host key verification
-
-Note: For production use, always run behind TLS (cert.pem + key.pem).
-      Without TLS, all traffic including passwords is sent in plaintext.
-
+Example:
+  webssh -p 443 -knock "secret123" -key ~/.ssh/known_hosts -http3
 `)
 	os.Exit(0)
 }
 
-func main() {
-	flagPort := flag.Int("p", 3400, "Port to listen on")
-	flagDebug := flag.Bool("debug", false, "Enable debug mode (logs to debug.log)")
-	flagKey := flag.String("key", "", "Path to SSH known_hosts file for host key verification")
-	flagHelp := flag.Bool("h", false, "Show help message")
-
-	flag.Usage = printUsage
-	flag.Parse()
-
-	if *flagHelp {
-		printUsage()
-	}
-
-	debugMode = *flagDebug
-
-	// Определяем директорию, в которой находится исполняемый файл
-	exePath, err := os.Executable()
+// createHardenedTLSConfig — TLS с современными шифрами для "естественного" fingerprint
+func createHardenedTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		log.Fatalf("Cannot get executable path: %v", err)
+		return nil, err
 	}
-	baseDir := filepath.Dir(exePath)
-	log.Printf("Base directory: %s", baseDir)
-
-	if *flagKey != "" {
-		hostKeyCallback, err := knownhosts.New(*flagKey)
-		if err != nil {
-			log.Printf("Warning: Could not load known_hosts file '%s': %v", *flagKey, err)
-			log.Printf("Falling back to insecure host key verification")
-			knownHosts = ssh.InsecureIgnoreHostKey()
-		} else {
-			knownHosts = hostKeyCallback
-			log.Printf("SSH host key verification enabled using %s", *flagKey)
-			debugPrintf("Known hosts file loaded: %s", *flagKey)
-		}
-	} else {
-		log.Printf("Warning: SSH host key verification disabled (use -key to enable)")
-		knownHosts = ssh.InsecureIgnoreHostKey()
-	}
-
-	if debugMode {
-		logFilePath := filepath.Join(baseDir, "debug.log")
-		logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			log.Printf("Warning: Could not create debug.log: %v", err)
-		} else {
-			debugLog = log.New(logFile, "[DEBUG] ", log.Ldate|log.Ltime)
-			debugLog.Println("Debug mode enabled")
-			log.SetOutput(io.MultiWriter(os.Stdout, logFile))
-			log.Printf("Debug logging to %s enabled", logFilePath)
-		}
-	}
-
-	accessPath := filepath.Join(baseDir, "access.json")
-	if err := loadAccessConfig(accessPath); err != nil {
-		log.Printf("Warning: Could not load access.json: %v", err)
-		accessConfig = AccessConfig{AllowedIPs: []string{"*"}}
-	} else {
-		debugPrintf("Loaded access.json with %d allowed IPs", len(accessConfig.AllowedIPs))
-	}
-
-	http.HandleFunc("/", securityMiddleware(ipMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			http.ServeFile(w, r, filepath.Join(baseDir, "static", "index.html"))
-			return
-		}
-		// Защита от path traversal
-		if strings.Contains(r.URL.Path, "..") || !strings.HasPrefix(r.URL.Path, "/") {
-			http.NotFound(w, r)
-			return
-		}
-		rel := strings.TrimPrefix(r.URL.Path, "/")
-		fullPath := filepath.Join(baseDir, "static", rel)
-		// Дополнительная проверка, чтобы не выйти за пределы static/
-		staticDir := filepath.Join(baseDir, "static")
-		if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(staticDir)) {
-			http.NotFound(w, r)
-			return
-		}
-		http.ServeFile(w, r, fullPath)
-	})))
-
-	http.HandleFunc("/ws", securityMiddleware(ipMiddleware(handleWebSocket)))
-
-	port := fmt.Sprintf(":%d", *flagPort)
-
-	certFile := filepath.Join(baseDir, "cert.pem")
-	keyFile := filepath.Join(baseDir, "key.pem")
-
-	certExists := false
-	if _, err := os.Stat(certFile); err == nil {
-		certExists = true
-	}
-
-	keyExists := false
-	if _, err := os.Stat(keyFile); err == nil {
-		keyExists = true
-	}
-
-	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		MaxVersion: tls.VersionTLS13,
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		MaxVersion:   tls.VersionTLS13,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
@@ -518,12 +397,114 @@ func main() {
 		},
 		SessionTicketsDisabled:   true,
 		PreferServerCipherSuites: true,
+		NextProtos:               []string{"h2", "http/1.1"}, // ALPN для HTTP/2
+	}, nil
+}
+
+// serveHTTP3 — запуск HTTP/3 сервера (экспериментально)
+func serveHTTP3(addr string, handler http.Handler, certFile, keyFile string) error {
+	tlsCfg, err := createHardenedTLSConfig(certFile, keyFile)
+	if err != nil {
+		return err
 	}
+	tlsCfg.NextProtos = []string{"h3"} // ALPN для HTTP/3
+
+	h3Server := &http3.Server{
+		Addr:      addr,
+		Handler:   handler,
+		TLSConfig: tlsCfg,
+	}
+	log.Printf("HTTP/3 listener on %s", addr)
+	return h3Server.ListenAndServeTLS(certFile, keyFile)
+}
+
+func main() {
+	flagPort := flag.Int("p", 3400, "Port")
+	flagDebug := flag.Bool("debug", false, "Debug mode")
+	flagKey := flag.String("key", "", "SSH known_hosts path")
+	flagKnock := flag.String("knock", "", "X-Knock header value")
+	flagHTTP3 := flag.Bool("http3", false, "Enable HTTP/3")
+	flagHelp := flag.Bool("h", false, "Help")
+
+	flag.Usage = printUsage
+	flag.Parse()
+	if *flagHelp {
+		printUsage()
+	}
+
+	debugMode = *flagDebug
+	knockHeader = *flagKnock
+
+	exePath, _ := os.Executable()
+	baseDir := filepath.Dir(exePath)
+
+	// SSH host key verification
+	if *flagKey != "" {
+		cb, err := knownhosts.New(*flagKey)
+		if err != nil {
+			log.Printf("Warning: known_hosts load failed: %v", err)
+			knownHosts = ssh.InsecureIgnoreHostKey()
+		} else {
+			knownHosts = cb
+			log.Printf("SSH host key verification enabled: %s", *flagKey)
+		}
+	} else {
+		log.Printf("Warning: SSH host key verification DISABLED")
+		knownHosts = ssh.InsecureIgnoreHostKey()
+	}
+
+	// Debug logging
+	if debugMode {
+		logFile, err := os.OpenFile(filepath.Join(baseDir, "debug.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			debugLog = log.New(logFile, "[DEBUG] ", log.Ldate|log.Ltime)
+			log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+		}
+	}
+
+	// Access config
+	accessPath := filepath.Join(baseDir, "access.json")
+	if err := loadAccessConfig(accessPath); err != nil {
+		log.Printf("Warning: access.json not loaded: %v", err)
+		accessConfig = AccessConfig{AllowedIPs: []string{"*"}}
+	}
+
+	// Handlers with middleware chain
+	rootHandler := securityMiddleware(ipMiddleware(knockMiddleware(masqueradeMiddleware(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" {
+				http.ServeFile(w, r, filepath.Join(baseDir, "static", "index.html"))
+				return
+			}
+			if strings.Contains(r.URL.Path, "..") {
+				http.NotFound(w, r)
+				return
+			}
+			rel := strings.TrimPrefix(r.URL.Path, "/")
+			fullPath := filepath.Join(baseDir, "static", rel)
+			staticDir := filepath.Join(baseDir, "static")
+			if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(staticDir)) {
+				http.NotFound(w, r)
+				return
+			}
+			http.ServeFile(w, r, fullPath)
+		},
+	))))
+
+	wsHandler := securityMiddleware(ipMiddleware(knockMiddleware(masqueradeMiddleware(handleWebSocket))))
+	http.HandleFunc("/", rootHandler)
+	http.HandleFunc("/ws", wsHandler)
+
+	port := fmt.Sprintf(":%d", *flagPort)
+	certFile := filepath.Join(baseDir, "cert.pem")
+	keyFile := filepath.Join(baseDir, "key.pem")
+
+	certExists := fileExists(certFile)
+	keyExists := fileExists(keyFile)
 
 	server := &http.Server{
 		Addr:           port,
 		Handler:        nil,
-		TLSConfig:      tlsConfig,
 		ReadTimeout:    30 * time.Second,
 		WriteTimeout:   30 * time.Second,
 		IdleTimeout:    120 * time.Second,
@@ -534,20 +515,39 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	if certExists && keyExists {
-		log.Printf("Web SSH Client starting on https://localhost%s", port)
-		log.Printf("TLS 1.3 enabled, modern ciphers only")
-		debugPrintf("TLS enabled with cert=%s key=%s", certFile, keyFile)
+		log.Printf("Starting HTTPS on https://localhost%s", port)
+		tlsCfg, err := createHardenedTLSConfig(certFile, keyFile)
+		if err != nil {
+			log.Fatalf("TLS config error: %v", err)
+		}
+		server.TLSConfig = tlsCfg
 
+		// HTTPS server
 		go func() {
-			if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+			ln, err := net.Listen("tcp", port)
+			if err != nil {
+				log.Fatalf("Listen error: %v", err)
+			}
+			defer ln.Close()
+			tlsLn := tls.NewListener(ln, tlsCfg)
+			if err := server.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("Server error: %v", err)
 			}
 		}()
-	} else {
-		log.Printf("CRITICAL: TLS certificates not found (%s, %s)", certFile, keyFile)
-		log.Printf("Starting on http://localhost%s without encryption!", port)
-		log.Printf("Generate with: openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes")
 
+		// HTTP/3 (optional)
+		if *flagHTTP3 {
+			go func() {
+				if err := serveHTTP3(port, server.Handler, certFile, keyFile); err != nil {
+					log.Printf("HTTP/3 error (optional): %v", err)
+				}
+			}()
+			log.Println("HTTP/3 enabled (experimental)")
+		}
+
+	} else {
+		log.Printf("WARNING: No TLS certs found, starting HTTP on http://localhost%s", port)
+		log.Printf("Generate certs: openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes")
 		go func() {
 			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("Server error: %v", err)
@@ -556,12 +556,14 @@ func main() {
 	}
 
 	<-stop
-	log.Println("Shutting down server...")
-
+	log.Println("Shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
-	}
-	log.Println("Server stopped")
+	_ = server.Shutdown(ctx)
+	log.Println("Stopped")
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
