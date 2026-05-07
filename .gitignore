@@ -1,0 +1,18 @@
+# Built binary
+webssh
+webssh.exe
+
+# Debug logs
+debug.log
+
+# TLS certificates
+*.pem
+
+# Personal config
+access.json
+
+# IDE
+.vscode/
+.idea/
+.clerules
+
