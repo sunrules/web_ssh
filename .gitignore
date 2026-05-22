@@ -1,17 +1,19 @@
 # Built binary
 webssh
+web_ssh.exe
 webssh.exe
-go.mod
-go.sum
+
 # Debug logs
 debug.log
+
 # TLS certificates
-*.pem
-# Personal config
-access.json
+key.pem
+cert.pem
+
 # IDE
-.gitignore
 .vscode/
 .idea/
-.clerules/
-.clinerules/cline-config.md
+.clinerules/
+
+# Git
+.git/
