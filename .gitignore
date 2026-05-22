@@ -1,16 +1,14 @@
 # Built binary
 webssh
 webssh.exe
-
+go.mod
+go.sum
 # Debug logs
 debug.log
-
 # TLS certificates
 *.pem
-
 # Personal config
 access.json
-
 # IDE
 .gitignore
 .vscode/

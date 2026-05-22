@@ -63,7 +63,7 @@ body {
     background: #764ba2;
 }
 
-/* Terminal container */
+/* Terminal container — flex column for header + terminal */
 #terminal-container {
     display: none;
     flex-direction: column;
@@ -103,6 +103,7 @@ body {
     background: #cc0000;
 }
 
+/* Terminal wrapper — fills remaining space */
 #terminal {
     flex: 1 1 auto;
     position: relative;
@@ -111,32 +112,37 @@ body {
     min-width: 0;
 }
 
-/* xterm overrides */
-.xterm {
+/* Full-height xterm */
+#terminal .terminal,
+#terminal .xterm {
     height: 100% !important;
     width: 100% !important;
+}
+
+#terminal .xterm {
     padding: 4px;
 }
 
-.xterm .xterm-viewport {
+/* xterm scrollbar styling */
+#terminal .xterm-viewport {
     scrollbar-width: thin;
     scrollbar-color: #555 #1e1e1e;
 }
 
-.xterm .xterm-viewport::-webkit-scrollbar {
+#terminal .xterm-viewport::-webkit-scrollbar {
     width: 8px;
 }
 
-.xterm .xterm-viewport::-webkit-scrollbar-track {
+#terminal .xterm-viewport::-webkit-scrollbar-track {
     background: #1e1e1e;
 }
 
-.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+#terminal .xterm-viewport::-webkit-scrollbar-thumb {
     background: #555;
     border-radius: 4px;
 }
 
-.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+#terminal .xterm-viewport::-webkit-scrollbar-thumb:hover {
     background: #777;
 }
 

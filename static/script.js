@@ -1,3 +1,6 @@
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+
 let term = null;
 let ws = null;
 let fitAddon = null;
@@ -66,15 +69,19 @@ function connectSSH(host, port, username, password) {
     };
 
     ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
+        try {
+            const data = JSON.parse(event.data);
 
-        if (data.type === 'output') {
-            if (term) {
-                term.write(data.data);
+            if (data.type === 'output') {
+                if (term) {
+                    term.write(data.data);
+                }
+            } else if (data.type === 'error') {
+                alert('SSH Error: ' + data.error);
+                disconnect();
             }
-        } else if (data.type === 'error') {
-            alert('SSH Error: ' + data.error);
-            disconnect();
+        } catch (e) {
+            console.error('Failed to parse message:', e);
         }
     };
 
@@ -91,6 +98,11 @@ function connectSSH(host, port, username, password) {
 }
 
 function initTerminal() {
+    if (!document.getElementById('terminal')) {
+        console.error('Terminal element not found');
+        return;
+    }
+
     term = new Terminal({
         cursorBlink: true,
         fontSize: 14,
@@ -127,7 +139,7 @@ function initTerminal() {
         allowProposedApi: true
     });
 
-    fitAddon = new FitAddon.FitAddon();
+    fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
 
     term.open(document.getElementById('terminal'));
@@ -160,7 +172,7 @@ function initTerminal() {
         showClipboardNotification('Pasted from clipboard!');
     });
 
-    // Right-click to copy selection
+    // Right-click to copy selection or paste
     const terminalElement = document.getElementById('terminal');
     terminalElement.addEventListener('contextmenu', (e) => {
         e.preventDefault();
@@ -173,7 +185,6 @@ function initTerminal() {
             });
             term.clearSelection();
         } else {
-            // No selection — try to paste from clipboard
             navigator.clipboard.readText().then(text => {
                 if (text && ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ command: text }));
@@ -181,11 +192,6 @@ function initTerminal() {
                 }
             }).catch(() => {});
         }
-    });
-
-    // Double-click to select word
-    terminalElement.addEventListener('dblclick', () => {
-        // xterm handles word selection natively
     });
 
     // Resize handling — debounced
@@ -212,6 +218,7 @@ function initTerminal() {
 function disconnect() {
     if (ws) {
         ws.close();
+        ws = null;
     }
     if (term) {
         term.dispose();
@@ -225,6 +232,7 @@ function disconnect() {
 
 function showClipboardNotification(message) {
     const notification = document.getElementById('clipboard-notification');
+    if (!notification) return;
     notification.textContent = message;
     notification.classList.add('show');
     setTimeout(() => {
