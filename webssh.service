@@ -7,7 +7,7 @@ Type=simple
 User=vmorozov
 Group=vmorozov
 WorkingDirectory=/home/vmorozov/DEV/web_ssh-main
-ExecStart=/home/vmorozov/DEV/web_ssh-main/webssh -p 3400 -http3
+ExecStart=/home/vmorozov/DEV/web_ssh-main/webssh -p 3400
 Restart=on-failure
 RestartSec=5
 

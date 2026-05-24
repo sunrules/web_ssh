@@ -33,9 +33,17 @@ body {
 }
 
 .login-form h2 {
-    margin-bottom: 20px;
+    margin-bottom: 5px;
     color: #333;
     text-align: center;
+}
+
+.login-form .version-info {
+    text-align: center;
+    font-size: 11px;
+    color: #888;
+    margin-bottom: 15px;
+    font-family: 'Courier New', monospace;
 }
 
 .login-form input {
@@ -63,7 +71,7 @@ body {
     background: #764ba2;
 }
 
-/* Terminal container — flex column for header + terminal */
+/* Terminal container */
 #terminal-container {
     display: none;
     flex-direction: column;
@@ -103,7 +111,6 @@ body {
     background: #cc0000;
 }
 
-/* Terminal wrapper — fills remaining space */
 #terminal {
     flex: 1 1 auto;
     position: relative;
@@ -112,37 +119,32 @@ body {
     min-width: 0;
 }
 
-/* Full-height xterm */
-#terminal .terminal,
-#terminal .xterm {
+/* xterm overrides */
+.xterm {
     height: 100% !important;
     width: 100% !important;
-}
-
-#terminal .xterm {
     padding: 4px;
 }
 
-/* xterm scrollbar styling */
-#terminal .xterm-viewport {
+.xterm .xterm-viewport {
     scrollbar-width: thin;
     scrollbar-color: #555 #1e1e1e;
 }
 
-#terminal .xterm-viewport::-webkit-scrollbar {
+.xterm .xterm-viewport::-webkit-scrollbar {
     width: 8px;
 }
 
-#terminal .xterm-viewport::-webkit-scrollbar-track {
+.xterm .xterm-viewport::-webkit-scrollbar-track {
     background: #1e1e1e;
 }
 
-#terminal .xterm-viewport::-webkit-scrollbar-thumb {
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
     background: #555;
     border-radius: 4px;
 }
 
-#terminal .xterm-viewport::-webkit-scrollbar-thumb:hover {
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
     background: #777;
 }
 

@@ -1,10 +1,18 @@
-import { Terminal } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
-
 let term = null;
 let ws = null;
 let fitAddon = null;
 let resizeSent = false;
+
+// Load default connection settings from server webssh.conf
+fetch('/config')
+    .then(r => r.json())
+    .then(cfg => {
+        if (cfg.host) document.getElementById('host').value = cfg.host;
+        if (cfg.port) document.getElementById('port').value = cfg.port;
+    })
+    .catch(() => {
+        // keep defaults if config endpoint unavailable
+    });
 
 document.getElementById('ssh-form').addEventListener('submit', (e) => {
     e.preventDefault();
@@ -69,19 +77,15 @@ function connectSSH(host, port, username, password) {
     };
 
     ws.onmessage = (event) => {
-        try {
-            const data = JSON.parse(event.data);
+        const data = JSON.parse(event.data);
 
-            if (data.type === 'output') {
-                if (term) {
-                    term.write(data.data);
-                }
-            } else if (data.type === 'error') {
-                alert('SSH Error: ' + data.error);
-                disconnect();
+        if (data.type === 'output') {
+            if (term) {
+                term.write(data.data);
             }
-        } catch (e) {
-            console.error('Failed to parse message:', e);
+        } else if (data.type === 'error') {
+            alert('SSH Error: ' + data.error);
+            disconnect();
         }
     };
 
@@ -98,11 +102,6 @@ function connectSSH(host, port, username, password) {
 }
 
 function initTerminal() {
-    if (!document.getElementById('terminal')) {
-        console.error('Terminal element not found');
-        return;
-    }
-
     term = new Terminal({
         cursorBlink: true,
         fontSize: 14,
@@ -139,7 +138,7 @@ function initTerminal() {
         allowProposedApi: true
     });
 
-    fitAddon = new FitAddon();
+    fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
 
     term.open(document.getElementById('terminal'));
@@ -172,7 +171,7 @@ function initTerminal() {
         showClipboardNotification('Pasted from clipboard!');
     });
 
-    // Right-click to copy selection or paste
+    // Right-click to copy selection
     const terminalElement = document.getElementById('terminal');
     terminalElement.addEventListener('contextmenu', (e) => {
         e.preventDefault();
@@ -185,6 +184,7 @@ function initTerminal() {
             });
             term.clearSelection();
         } else {
+            // No selection — try to paste from clipboard
             navigator.clipboard.readText().then(text => {
                 if (text && ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ command: text }));
@@ -192,6 +192,11 @@ function initTerminal() {
                 }
             }).catch(() => {});
         }
+    });
+
+    // Double-click to select word
+    terminalElement.addEventListener('dblclick', () => {
+        // xterm handles word selection natively
     });
 
     // Resize handling — debounced
@@ -218,7 +223,6 @@ function initTerminal() {
 function disconnect() {
     if (ws) {
         ws.close();
-        ws = null;
     }
     if (term) {
         term.dispose();
@@ -232,7 +236,6 @@ function disconnect() {
 
 function showClipboardNotification(message) {
     const notification = document.getElementById('clipboard-notification');
-    if (!notification) return;
     notification.textContent = message;
     notification.classList.add('show');
     setTimeout(() => {

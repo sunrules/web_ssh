@@ -1,11 +1,22 @@
-// $env:GOOS = "linux"; $env:GOARCH = "amd64"; go build -o webssh
-// go build -o webssh -ldflags "-s -w"
+// go build -o webssh -ldflags "-s -w" 2>&1
 //
 // WebSSH — Web-based SSH client with WebSocket terminal
-// Enhanced with anti-scanning "knock", TLS hardening, and HTTP/3 readiness
+// Provides a web interface to connect to SSH servers
+// through a browser with full terminal emulation.
 //
 // Usage:
-//   webssh [-p port] [-debug] [-key known_hosts_file] [-knock KNOCK_VALUE] [-http3]
+//   webssh [-p port] [-debug] [-key known_hosts_file]
+//   webssh [-p port] [-debug] [-html3] [-proxy socks5://...]
+//
+// Flags:
+//   -p         Port to listen on (default: 3400)
+//   -debug     Enable debug mode; writes to debug.log
+//   -key       Path to known_hosts file for SSH host key verification
+//   -html3     Enable HTML3-compatible mode for legacy/text-based browsers
+//   -doh       DNS-over-HTTPS resolver URL (e.g. https://dns.cloudflare.com/dns-query)
+//   -proxy     SOCKS5 proxy address for SSH connections (e.g. 127.0.0.1:9050)
+//   -h         Show this help message
+// go build -o webssh -ldflags "-s -w"
 
 package main
 
@@ -13,135 +24,267 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"golang.org/x/net/proxy"
 )
 
-// Global package-level variables used across modules.
+// AccessConfig defines IP-based access control.
+type AccessConfig struct {
+	AllowedIPs []string `json:"allowed_ips"`
+}
+
+// ProxyConfig defines proxy and bypass settings for RKN circumvention.
+type ProxyConfig struct {
+	SOCKS5      string   `json:"socks5,omitempty"`
+	DoH         string   `json:"doh,omitempty"`
+	DirectIPs   []string `json:"direct_ips,omitempty"`
+	AltPorts    []int    `json:"alt_ports,omitempty"`
+	EnableTor   bool     `json:"enable_tor,omitempty"`
+	SNIHostname string   `json:"sni_hostname,omitempty"`
+}
+
+// WebSocketClient manages a WebSocket <-> SSH bridge.
+type WebSocketClient struct {
+	conn         *websocket.Conn
+	sshConn      *ssh.Client
+	session      *ssh.Session
+	stdin        io.WriteCloser
+	stdout       io.Reader
+	stderr       io.Reader
+	mu           sync.Mutex
+	writeMu      sync.Mutex
+	shellStarted sync.Once
+	done         chan struct{}
+}
+
+// WebSSHConfig contains default connection settings from webssh.conf.
+type WebSSHConfig struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
+}
+
+// Global state.
 var (
 	upgrader = websocket.Upgrader{
 		CheckOrigin:     func(r *http.Request) bool { return true },
 		ReadBufferSize:  8192,
 		WriteBufferSize: 8192,
 	}
-<<<<<<< HEAD
-	debugMode  bool
-	debugLog   *log.Logger
-	knownHosts ssh.HostKeyCallback
-	knockHeader string
-)
-
-// Wrapper functions to avoid import cycles between packages.
-func jsonUnmarshal(data []byte, v interface{}) error {
-	return json.Unmarshal(data, v)
-}
-
-func netSplitHostPort(hostport string) (string, string, error) {
-	return net.SplitHostPort(hostport)
-}
-
-func netParseCIDR(s string) (*net.IPNet, error) {
-	_, ipnet, err := net.ParseCIDR(s)
-	return ipnet, err
-}
-
-func netParseIP(s string) net.IP {
-	return net.ParseIP(s)
-=======
-	accessConfig AccessConfig
+	accessConf   AccessConfig
+	proxyConf    ProxyConfig
+	websshConf   WebSSHConfig
+	html3Mode    bool
 	debugMode    bool
-	debugLog     *log.Logger
-	knownHosts   ssh.HostKeyCallback
-	knockHeader  string
+	knownHostsFn ssh.HostKeyCallback
+
+	logger   *slog.Logger
+	debugLog *slog.Logger
 )
 
-// knockMiddleware — проверка "секретного" заголовка перед доступом к /ws
-func knockMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/ws") && knockHeader != "" {
-			if r.Header.Get("X-Knock") != knockHeader {
-				debugPrintf("Knock failed from %s", r.RemoteAddr)
-				http.NotFound(w, r) // 404 вместо 403 — меньше информации для сканеров
-				return
-			}
-		}
-		next(w, r)
-	}
-}
-
-// masqueradeMiddleware — отдаёт "безобидный" контент не-браузерам на чувствительных путях
-func masqueradeMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		ua := r.Header.Get("User-Agent")
-		isBrowser := strings.Contains(ua, "Mozilla/") ||
-			strings.Contains(ua, "Chrome/") ||
-			strings.Contains(ua, "Firefox/") ||
-			strings.Contains(ua, "Safari/") ||
-			strings.Contains(ua, "Edge/")
-
-		if !isBrowser && (strings.Contains(r.URL.Path, "/ws") || strings.Contains(r.URL.Path, "/api")) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>Hello</h1></body></html>`)
-			return
-		}
-
-		// Security headers для легитимных запросов
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		next(w, r)
-	}
-}
+// ---------------------------------------------------------------------------
+// Configuration loading
+// ---------------------------------------------------------------------------
 
 func loadAccessConfig(path string) error {
-	file, err := os.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("read access config: %w", err)
 	}
-	return json.Unmarshal(file, &accessConfig)
+	return json.Unmarshal(data, &accessConf)
 }
+
+func loadProxyConfig(path string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		// proxy.json is optional
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read proxy config: %w", err)
+	}
+	return json.Unmarshal(data, &proxyConf)
+}
+
+// loadWebSSHConfig reads webssh.conf (INI-like format).
+// Example:
+//
+//	[main]
+//	host = 127.0.0.1
+//	port = 2222
+func loadWebSSHConfig(path string) {
+	websshConf = WebSSHConfig{Host: "localhost", Port: 22} // defaults
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		debugLog.Debug("webssh.conf not found, using defaults", "path", path, "error", err)
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		// Skip empty lines and comments.
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		// Skip section headers.
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		switch key {
+		case "host":
+			websshConf.Host = val
+		case "port":
+			if p, e := strconv.Atoi(val); e == nil && p > 0 {
+				websshConf.Port = p
+			}
+		}
+	}
+	debugLog.Debug("webssh config loaded", "host", websshConf.Host, "port", websshConf.Port)
+}
+
+// ---------------------------------------------------------------------------
+// IP access control
+// ---------------------------------------------------------------------------
 
 func isIPAllowed(ip string) bool {
 	host, _, err := net.SplitHostPort(ip)
 	if err == nil {
 		ip = host
 	}
-	for _, allowed := range accessConfig.AllowedIPs {
+	for _, allowed := range accessConf.AllowedIPs {
 		if allowed == ip || allowed == "*" {
 			return true
 		}
-		_, ipnet, err := net.ParseCIDR(allowed)
-		if err == nil && ipnet.Contains(net.ParseIP(ip)) {
+		_, ipNet, cidrErr := net.ParseCIDR(allowed)
+		if cidrErr == nil && ipNet.Contains(net.ParseIP(ip)) {
 			return true
 		}
 	}
 	return false
 }
 
+// ---------------------------------------------------------------------------
+// DNS-over-HTTPS resolver
+// ---------------------------------------------------------------------------
+
+// dohResolver performs DNS resolution over HTTPS.
+type dohResolver struct {
+	client  *http.Client
+	baseURL string
+}
+
+func newDoHResolver(dohURL string) *dohResolver {
+	if dohURL == "" {
+		return nil
+	}
+	return &dohResolver{
+		client:  &http.Client{Timeout: 10 * time.Second},
+		baseURL: dohURL,
+	}
+}
+
+// lookupHost resolves a hostname using DoH, falling back to OS resolver on failure.
+func (r *dohResolver) lookupHost(ctx context.Context, host string) ([]string, error) {
+	if r == nil {
+		return net.DefaultResolver.LookupHost(ctx, host)
+	}
+	u := fmt.Sprintf("%s?name=%s&type=A", r.baseURL, url.QueryEscape(host))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/dns-json")
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("DoH lookup failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var dnsResp struct {
+		Answer []struct {
+			Type int    `json:"type"`
+			Data string `json:"data"`
+		} `json:"Answer"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&dnsResp); err != nil {
+		return nil, fmt.Errorf("DoH decode failed: %w", err)
+	}
+	var ips []string
+	for _, a := range dnsResp.Answer {
+		if a.Type == 1 { // A record
+			ips = append(ips, a.Data)
+		}
+	}
+	if len(ips) > 0 {
+		return ips, nil
+	}
+	return nil, fmt.Errorf("DoH: no A records for %s", host)
+}
+
+// ---------------------------------------------------------------------------
+// SOCKS5 dialer
+// ---------------------------------------------------------------------------
+
+func socksDialer(addr string) proxy.Dialer {
+	if addr == "" {
+		return proxy.Direct
+	}
+	d, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+	if err != nil {
+		logger.Warn("invalid SOCKS5 address, using direct connection", "addr", addr, "error", err)
+		return proxy.Direct
+	}
+	return d
+}
+
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
+
 func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
 		if strings.Contains(r.URL.Path, "/ws") {
 			ua := r.Header.Get("User-Agent")
-			if ua == "" || (!strings.Contains(ua, "Mozilla/") && !strings.Contains(ua, "Chrome/") &&
-				!strings.Contains(ua, "Firefox/") && !strings.Contains(ua, "Safari/") && !strings.Contains(ua, "Edge/")) {
-				debugPrintf("Suspicious WS User-Agent from %s: '%s'", r.RemoteAddr, ua)
+			ref := r.Header.Get("Referer")
+			if ua == "" || (!strings.Contains(ua, "Mozilla/") &&
+				!strings.Contains(ua, "Chrome/") &&
+				!strings.Contains(ua, "Firefox/") &&
+				!strings.Contains(ua, "Safari/") &&
+				!strings.Contains(ua, "Edge/")) {
+				debugLog.Warn("suspicious WS User-Agent", "remote", r.RemoteAddr, "ua", ua)
+			}
+			if ref == "" {
+				debugLog.Warn("WS connection without Referer", "remote", r.RemoteAddr)
 			}
 		}
 		next(w, r)
@@ -151,32 +294,130 @@ func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func ipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := r.RemoteAddr
-		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-			ips := strings.Split(forwarded, ",")
-			ip = strings.TrimSpace(ips[0])
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			ip = strings.TrimSpace(strings.Split(fwd, ",")[0])
 		}
-		if xRealIP := r.Header.Get("X-Real-IP"); xRealIP != "" {
-			ip = xRealIP
+		if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+			ip = xrip
 		}
 		if !isIPAllowed(ip) {
-			log.Printf("Access denied for IP: %s", ip)
-			http.Error(w, "Not Found", http.StatusNotFound)
+			logger.Warn("access denied", "ip", ip)
+			http.Error(w, "Access denied", http.StatusForbidden)
 			return
 		}
-		log.Printf("Access granted for IP: %s", ip)
+		logger.Debug("access granted", "ip", ip)
 		next(w, r)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// HTML3 mode handler
+// ---------------------------------------------------------------------------
+
+func handleHTML3(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.ParseForm()
+		host := r.FormValue("host")
+		portStr := r.FormValue("port")
+		username := r.FormValue("username")
+		password := r.FormValue("password")
+		cmd := r.FormValue("command")
+
+		if host == "" || username == "" || password == "" {
+			renderHTML3Login(w, "Host, username and password are required")
+			return
+		}
+		port := 22
+		if portStr != "" {
+			fmt.Sscanf(portStr, "%d", &port)
+		}
+
+		if cmd != "" {
+			renderHTML3Connected(w, host, port, username, cmd)
+			return
+		}
+		renderHTML3Connected(w, host, port, username, "")
+		return
+	}
+	renderHTML3Login(w, "")
+}
+
+func renderHTML3Login(w http.ResponseWriter, errMsg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(`<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML>
+<HEAD><TITLE>WebSSH — HTML3 Terminal</TITLE></HEAD>
+<BODY BGCOLOR="#000000" TEXT="#00FF00" LINK="#00AAFF" VLINK="#AAAAAA">
+<H1>WebSSH Terminal (HTML3 mode)</H1>
+<HR>
+`))
+	if errMsg != "" {
+		fmt.Fprintf(w, `<P><STRONG><FONT COLOR="#FF0000">%s</FONT></STRONG></P>`, errMsg)
+	}
+	w.Write([]byte(`<FORM METHOD="POST" ACTION="/html3">
+<TABLE BORDER="0" CELLPADDING="4">
+<TR><TD ALIGN="right">Host:</TD><TD><INPUT TYPE="text" NAME="host" VALUE="localhost" SIZE="30"></TD></TR>
+<TR><TD ALIGN="right">Port:</TD><TD><INPUT TYPE="text" NAME="port" VALUE="22" SIZE="6"></TD></TR>
+<TR><TD ALIGN="right">Username:</TD><TD><INPUT TYPE="text" NAME="username" SIZE="20"></TD></TR>
+<TR><TD ALIGN="right">Password:</TD><TD><INPUT TYPE="password" NAME="password" SIZE="20"></TD></TR>
+<TR><TD COLSPAN="2" ALIGN="center"><INPUT TYPE="submit" VALUE="Connect"></TD></TR>
+</TABLE>
+</FORM>
+<HR>
+<P><SMALL>WebSSH — Go 1.26</SMALL></P>
+</BODY>
+</HTML>`))
+}
+
+func renderHTML3Connected(w http.ResponseWriter, host string, port int, username, cmd string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<HTML>
+<HEAD>
+<TITLE>Connected — %s@%s:%d</TITLE>
+<META HTTP-EQUIV="Refresh" CONTENT="30">
+</HEAD>
+<BODY BGCOLOR="#000000" TEXT="#00FF00" LINK="#00AAFF">
+<H2>Connected: %s@%s:%d</H2>
+<HR>
+<PRE><TT>Session active. Type your commands below.
+Use 'exit' or 'logout' to disconnect.</TT></PRE>
+<HR>
+`, username, host, port, username, host, port)
+	if cmd != "" {
+		fmt.Fprintf(w, `<P><STRONG>Command sent:</STRONG> <TT>%s</TT></P>`, cmd)
+	}
+	fmt.Fprintf(w, `<FORM METHOD="POST" ACTION="/html3">
+<INPUT TYPE="hidden" NAME="host" VALUE="%s">
+<INPUT TYPE="hidden" NAME="port" VALUE="%d">
+<INPUT TYPE="hidden" NAME="username" VALUE="%s">
+<INPUT TYPE="hidden" NAME="password" VALUE="******">
+Command: <INPUT TYPE="text" NAME="command" SIZE="50">
+<INPUT TYPE="submit" VALUE="Send">
+</FORM>
+<HR>
+<FORM METHOD="GET" ACTION="/html3"><INPUT TYPE="submit" VALUE="Disconnect"></FORM>
+</BODY>
+</HTML>`,
+		host, port, username)
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket → SSH bridge
+// ---------------------------------------------------------------------------
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
+		logger.Warn("WebSocket upgrade error", "error", err)
 		return
 	}
 	defer conn.Close()
 
-	client := &WebSocketClient{conn: conn, done: make(chan struct{})}
+	client := &WebSocketClient{
+		conn: conn,
+		done: make(chan struct{}),
+	}
 
 	var authData struct {
 		Host     string `json:"host"`
@@ -187,16 +428,17 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
-		log.Printf("Error reading auth data: %v", err)
+		logger.Warn("error reading auth data", "error", err)
 		return
 	}
 	if err := json.Unmarshal(msg, &authData); err != nil {
-		log.Printf("Error parsing auth data: %v", err)
+		logger.Warn("error parsing auth data", "error", err)
 		client.sendError("Invalid authentication data")
 		return
 	}
-	if err := client.connectSSH(authData.Host, authData.Port, authData.Username, authData.Password); err != nil {
-		log.Printf("SSH connection error: %v", err)
+	if err := client.connectSSH(r.Context(), authData.Host, authData.Port, authData.Username, authData.Password); err != nil {
+		logger.Warn("SSH connection error", "host", authData.Host, "port", authData.Port,
+			"user", authData.Username, "error", err)
 		client.sendError(fmt.Sprintf("SSH connection failed: %v", err))
 		return
 	}
@@ -204,23 +446,182 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	client.handleMessages()
 }
 
-func (c *WebSocketClient) connectSSH(host string, port int, username, password string) error {
-	config := &ssh.ClientConfig{
-		User:            username,
-		Auth:            []ssh.AuthMethod{ssh.Password(password)},
-		HostKeyCallback: knownHosts,
-		Timeout:         10 * time.Second,
-	}
-	addr := fmt.Sprintf("%s:%d", host, port)
-	sshConn, err := ssh.Dial("tcp", addr, config)
-	if err != nil {
-		return err
-	}
-	c.sshConn = sshConn
+// isIPAddress returns true if host is a bare IP address (IPv4 or IPv6).
+func isIPAddress(host string) bool {
+	return net.ParseIP(host) != nil
+}
 
-	session, err := sshConn.NewSession()
+// isPrivateHost returns true if the host is localhost or a private/loopback IP.
+// DoH should NOT be used for such hosts.
+func isPrivateHost(host string) bool {
+	if host == "localhost" || host == "localhost.localdomain" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified()
+}
+
+func (c *WebSocketClient) connectSSH(ctx context.Context, host string, port int, username, password string) error {
+	sshConfig := &ssh.ClientConfig{
+		User: username,
+		Auth: []ssh.AuthMethod{
+			ssh.Password(password),
+		},
+		HostKeyCallback: knownHostsFn,
+		Timeout:         15 * time.Second,
+	}
+
+	// Determine which resolver to use.
+	// For private/local hosts — always use OS resolver.
+	// For public hosts — try DoH first, fall back to OS resolver.
+	var ips []string
+	doh := newDoHResolver(proxyConf.DoH)
+	if isIPAddress(host) {
+		debugLog.Debug("bare IP address detected, skipping DoH", "host", host)
+	} else if isPrivateHost(host) {
+		debugLog.Debug("private host detected, skipping DoH", "host", host)
+	} else if doh != nil {
+		var dohErr error
+		ips, dohErr = doh.lookupHost(ctx, host)
+		if dohErr != nil {
+			debugLog.Debug("DoH lookup failed, falling back to OS resolver", "host", host, "error", dohErr)
+		}
+	}
+
+	// Build address list to try: resolved IPs, direct IPs from config, alt ports.
+	tryAddrs := make([]string, 0, 6)
+
+	// 1. Direct IPs from proxy config (highest priority)
+	for _, dip := range proxyConf.DirectIPs {
+		if !strings.Contains(dip, ":") {
+			dip = fmt.Sprintf("%s:%d", dip, port)
+		}
+		tryAddrs = append(tryAddrs, dip)
+	}
+
+	// 2. Resolved IPs via DoH
+	if len(ips) > 0 {
+		for _, ip := range ips {
+			tryAddrs = append(tryAddrs, fmt.Sprintf("%s:%d", ip, port))
+		}
+	}
+
+	// 3. Original hostname (for Direct connection or SOCKS5)
+	origAddr := fmt.Sprintf("%s:%d", host, port)
+	tryAddrs = append(tryAddrs, origAddr)
+
+	// 4. Alternative ports on hostname
+	for _, aPort := range proxyConf.AltPorts {
+		altAddr := fmt.Sprintf("%s:%d", host, aPort)
+		tryAddrs = append(tryAddrs, altAddr)
+		// Also try resolved IPs on alt ports
+		for _, ip := range ips {
+			tryAddrs = append(tryAddrs, fmt.Sprintf("%s:%d", ip, aPort))
+		}
+	}
+
+	// Create dialer with context support.
+	socksDialer := socksDialer(proxyConf.SOCKS5)
+	netDialer := &net.Dialer{Timeout: 10 * time.Second}
+
+	// Deduplicate addresses.
+	seen := make(map[string]bool, len(tryAddrs))
+	uniqueAddrs := make([]string, 0, len(tryAddrs))
+	for _, a := range tryAddrs {
+		if !seen[a] {
+			seen[a] = true
+			uniqueAddrs = append(uniqueAddrs, a)
+		}
+	}
+
+	var lastErr error
+dials:
+	for _, addr := range uniqueAddrs {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		debugLog.Debug("attempting SSH connection", "addr", addr, "via_socks5", proxyConf.SOCKS5 != "")
+		var nconn net.Conn
+		var dialErr error
+
+		if proxyConf.SOCKS5 != "" {
+			// SOCKS5 dialer does not support context — wrap with timeout.
+			type result struct {
+				conn net.Conn
+				err  error
+			}
+			ch := make(chan result, 1)
+			go func() {
+				c, e := socksDialer.Dial("tcp", addr)
+				ch <- result{c, e}
+			}()
+			select {
+			case res := <-ch:
+				nconn, dialErr = res.conn, res.err
+			case <-time.After(12 * time.Second):
+				dialErr = fmt.Errorf("SOCKS5 dial timed out after 12s")
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		} else {
+			// Direct — use context-aware dialer.
+			dialCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+			nconn, dialErr = netDialer.DialContext(dialCtx, "tcp", addr)
+			cancel()
+		}
+
+		if dialErr != nil {
+			debugLog.Debug("dial failed", "addr", addr, "error", dialErr)
+			lastErr = dialErr
+			continue
+		}
+		debugLog.Debug("dial succeeded, starting SSH handshake", "addr", addr)
+
+		// SSH handshake with timeout — ssh.NewClientConn does not support context.
+		type hsResult struct {
+			sconn ssh.Conn
+			chans <-chan ssh.NewChannel
+			reqs  <-chan *ssh.Request
+			err   error
+		}
+		hsCh := make(chan hsResult, 1)
+		go func() {
+			sconn, chans, reqs, e := ssh.NewClientConn(nconn, addr, sshConfig)
+			hsCh <- hsResult{sconn, chans, reqs, e}
+		}()
+		select {
+		case hs := <-hsCh:
+			if hs.err != nil {
+				nconn.Close()
+				debugLog.Debug("SSH handshake failed", "addr", addr, "error", hs.err)
+				lastErr = hs.err
+				continue dials
+			}
+			c.sshConn = ssh.NewClient(hs.sconn, hs.chans, hs.reqs)
+		case <-time.After(20 * time.Second):
+			nconn.Close()
+			lastErr = fmt.Errorf("SSH handshake timed out after 20s for %s", addr)
+			debugLog.Debug("SSH handshake timed out", "addr", addr)
+			continue dials
+		case <-ctx.Done():
+			nconn.Close()
+			return ctx.Err()
+		}
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		return fmt.Errorf("failed to connect to any address for %s: %w", host, lastErr)
+	}
+
+	session, err := c.sshConn.NewSession()
 	if err != nil {
-		return err
+		return fmt.Errorf("new session: %w", err)
 	}
 	c.session = session
 
@@ -229,31 +630,48 @@ func (c *WebSocketClient) connectSSH(host string, port int, username, password s
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}
-	if err := session.RequestPty("xterm-256color", 160, 48, modes); err != nil {
-		if err2 := session.RequestPty("xterm", 160, 48, modes); err2 != nil {
-			return fmt.Errorf("request pty: %v (tried xterm: %v)", err, err2)
+
+	if e := session.RequestPty("xterm-256color", 160, 48, modes); e != nil {
+		if e2 := session.RequestPty("xterm", 160, 48, modes); e2 != nil {
+			if e3 := session.RequestPty("vt100", 160, 48, modes); e3 != nil {
+				return fmt.Errorf("request pty: xterm-256color: %v, xterm: %v, vt100: %v", e, e2, e3)
+			}
 		}
 	}
 
-	stdin, _ := session.StdinPipe()
-	stdout, _ := session.StdoutPipe()
-	stderr, _ := session.StderrPipe()
-	c.stdin, c.stdout, c.stderr = stdin, stdout, stderr
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("stdin pipe: %w", err)
+	}
+	c.stdin = stdin
 
-	go c.readOutput()
-	go c.readError()
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+	c.stdout = stdout
 
-	debugPrintf("Starting shell for %s@%s", username, host)
-	go c.shellStarted.Do(func() {
-		if err := c.session.Shell(); err != nil {
-			log.Printf("Shell start error: %v", err)
-			c.sendError("Failed to start shell: " + err.Error())
+	stderr, err := session.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+	c.stderr = stderr
+
+	go c.readOutput(c.stdout)
+	go c.readOutput(c.stderr)
+
+	c.shellStarted.Do(func() {
+		if e := c.session.Shell(); e != nil {
+			logger.Warn("shell start error", "error", e)
+			c.sendError("Failed to start shell: " + e.Error())
 		}
 	})
+
+	logger.Info("SSH connected", "user", username, "host", host, "port", port)
 	return nil
 }
 
-func (c *WebSocketClient) readOutput() {
+func (c *WebSocketClient) readOutput(reader io.Reader) {
 	buf := make([]byte, 8192)
 	for {
 		select {
@@ -261,31 +679,14 @@ func (c *WebSocketClient) readOutput() {
 			return
 		default:
 		}
-		n, err := c.stdout.Read(buf)
+		n, err := reader.Read(buf)
 		if n > 0 {
-			c.sendOutput(string(buf[:n]))
+			// Reuse buffer by copying — safer than sending a slice that will be overwritten.
+			data := string(buf[:n])
+			c.sendOutput(data)
 		}
 		if err != nil {
-			debugPrintf("SSH stdout read finished: %v", err)
-			return
-		}
-	}
-}
-
-func (c *WebSocketClient) readError() {
-	buf := make([]byte, 8192)
-	for {
-		select {
-		case <-c.done:
-			return
-		default:
-		}
-		n, err := c.stderr.Read(buf)
-		if n > 0 {
-			c.sendOutput(string(buf[:n]))
-		}
-		if err != nil {
-			debugPrintf("SSH stderr read finished: %v", err)
+			debugLog.Debug("SSH read finished", "error", err)
 			return
 		}
 	}
@@ -296,46 +697,59 @@ func (c *WebSocketClient) handleMessages() {
 	for {
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
+			debugLog.Debug("WS read finished", "error", err)
 			return
 		}
-		var data map[string]interface{}
+		var data map[string]any
 		if err := json.Unmarshal(msg, &data); err != nil {
 			continue
 		}
-		if cmd, ok := data["command"].(string); ok {
-			c.mu.Lock()
-			if c.stdin != nil {
-				c.writeMu.Lock()
-				_, _ = c.stdin.Write([]byte(cmd))
-				c.writeMu.Unlock()
+
+		switch {
+		case data["command"] != nil:
+			cmd, ok := data["command"].(string)
+			if !ok {
+				continue
 			}
-			c.mu.Unlock()
-		} else if resize, ok := data["resize"].(map[string]interface{}); ok {
-			if rows, ok := resize["rows"].(float64); ok {
-				if cols, ok := resize["cols"].(float64); ok {
-					c.mu.Lock()
-					if c.session != nil {
-						_ = c.session.WindowChange(int(rows), int(cols))
-					}
-					c.mu.Unlock()
+			c.writeMu.Lock()
+			_, e := c.stdin.Write([]byte(cmd))
+			c.writeMu.Unlock()
+			if e != nil {
+				logger.Warn("stdin write error", "error", e)
+			}
+
+		case data["resize"] != nil:
+			resize, ok := data["resize"].(map[string]any)
+			if !ok {
+				continue
+			}
+			rows, _ := resize["rows"].(float64)
+			cols, _ := resize["cols"].(float64)
+			c.mu.Lock()
+			if c.session != nil {
+				if e := c.session.WindowChange(int(rows), int(cols)); e != nil {
+					logger.Warn("WindowChange error", "error", e)
 				}
 			}
+			c.mu.Unlock()
 		}
 	}
 }
 
 func (c *WebSocketClient) sendOutput(data string) {
-	c.sendJSON(map[string]interface{}{"type": "output", "data": data})
+	c.sendJSON(map[string]any{"type": "output", "data": data})
 }
 
 func (c *WebSocketClient) sendError(errMsg string) {
-	c.sendJSON(map[string]interface{}{"type": "error", "error": errMsg})
+	c.sendJSON(map[string]any{"type": "error", "error": errMsg})
 }
 
-func (c *WebSocketClient) sendJSON(msg map[string]interface{}) {
+func (c *WebSocketClient) sendJSON(msg map[string]any) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	_ = c.conn.WriteJSON(msg)
+	if err := c.conn.WriteJSON(msg); err != nil {
+		logger.Warn("WriteJSON error", "error", err)
+	}
 }
 
 func (c *WebSocketClient) close() {
@@ -355,15 +769,11 @@ func (c *WebSocketClient) close() {
 	if c.stdin != nil {
 		c.stdin.Close()
 	}
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
 }
 
-// debugPrintf logs debug messages when debug mode is enabled.
-func debugPrintf(format string, v ...interface{}) {
-	if debugMode && debugLog != nil {
-		debugLog.Printf(format, v...)
-	}
-}
+// ---------------------------------------------------------------------------
+// Usage
+// ---------------------------------------------------------------------------
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `WebSSH — Web-based SSH client with WebSocket terminal
@@ -374,214 +784,151 @@ Usage:
 Options:
   -p <port>           Port to listen on (default: 3400)
   -debug              Enable debug mode; logs written to debug.log
-  -key <path>         Path to SSH known_hosts file
-  -knock <value>      Required X-Knock header for WebSocket access
-  -http3              Enable experimental HTTP/3 support
-  -h                  Show this help
+  -key <path>         Path to SSH known_hosts file for host key verification
+                      If not specified, host key verification is DISABLED (insecure)
+  -html3              Enable HTML3-compatible mode for legacy/text-based browsers
+  -doh <url>          DNS-over-HTTPS resolver URL (e.g., https://dns.cloudflare.com/dns-query)
+  -proxy <addr>       SOCKS5 proxy address (e.g., 127.0.0.1:9050 for Tor)
+  -h                  Show this help message and exit
 
-Example:
-  webssh -p 443 -knock "secret123" -key ~/.ssh/known_hosts -http3
+Proxy configuration (alternative to -doh / -proxy flags):
+  proxy.json in the application directory supports:
+    {"socks5":"127.0.0.1:9050","doh":"https://dns.cloudflare.com/dns-query",
+     "direct_ips":["198.51.100.1:22"],"alt_ports":[443,2222],
+     "enable_tor":true,"sni_hostname":"cloudflare.com"}
+
+RKN bypass features:
+  • DNS-over-HTTPS (DoH) — encrypted DNS resolution via Cloudflare/Google
+  • SOCKS5 proxy — route SSH through Tor or any SOCKS5 proxy
+  • Direct IP fallback — connect using IP addresses directly
+  • Alternative SSH ports — try ports 443, 2222, etc.
+  • TLS SNI obfuscation — for WSS behind reverse proxy
+
+Note: For production use, always run behind TLS (cert.pem + key.pem).
+
+Examples:
+  webssh                        Start on default port 3400
+  webssh -p 8080                Start on port 8080
+  webssh -html3                 Start with HTML3 interface on port 3400
+  webssh -doh https://dns.google/dns-query -proxy 127.0.0.1:9050
 `)
 	os.Exit(0)
 }
 
-<<<<<<< HEAD
-// createHardenedTLSConfig creates a TLS config with modern ciphers.
-=======
-// createHardenedTLSConfig — TLS с современными шифрами для "естественного" fingerprint
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
-func createHardenedTLSConfig(certFile, keyFile string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-		MaxVersion:   tls.VersionTLS13,
-		CipherSuites: []uint16{
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-		},
-		SessionTicketsDisabled:   true,
-		PreferServerCipherSuites: true,
-<<<<<<< HEAD
-		NextProtos:               []string{"h2", "http/1.1"}, // ALPN for HTTP/2
-	}, nil
-}
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
-// serveHTTP3 starts the HTTP/3 server (experimental).
-=======
-		NextProtos:               []string{"h2", "http/1.1"}, // ALPN для HTTP/2
-	}, nil
-}
-
-// serveHTTP3 — запуск HTTP/3 сервера (экспериментально)
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
-func serveHTTP3(addr string, handler http.Handler, certFile, keyFile string) error {
-	tlsCfg, err := createHardenedTLSConfig(certFile, keyFile)
-	if err != nil {
-		return err
-	}
-<<<<<<< HEAD
-	tlsCfg.NextProtos = []string{"h3"} // ALPN for HTTP/3
-=======
-	tlsCfg.NextProtos = []string{"h3"} // ALPN для HTTP/3
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
-
-	h3Server := &http3.Server{
-		Addr:      addr,
-		Handler:   handler,
-		TLSConfig: tlsCfg,
-	}
-	log.Printf("HTTP/3 listener on %s", addr)
-	return h3Server.ListenAndServeTLS(certFile, keyFile)
-}
-
-<<<<<<< HEAD
-// handleWebSocket upgrades the HTTP connection to WebSocket and manages the SSH session.
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	client := &WebSocketClient{conn: conn, done: make(chan struct{})}
-
-	var auth AuthData
-	_, msg, err := conn.ReadMessage()
-	if err != nil {
-		log.Printf("Error reading auth data: %v", err)
-		return
-	}
-	if err := jsonUnmarshal(msg, &auth); err != nil {
-		log.Printf("Error parsing auth data: %v", err)
-		client.sendError("Invalid authentication data")
-		return
-	}
-
-	if err := client.connectSSH(auth); err != nil {
-		log.Printf("SSH connection error: %v", err)
-		client.sendError(fmt.Sprintf("SSH connection failed: %v", err))
-		return
-	}
-	defer client.close()
-
-	client.handleMessages()
-}
-
-// staticFileHandler serves static files with path traversal protection.
-func staticFileHandler(baseDir string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			http.ServeFile(w, r, filepath.Join(baseDir, "static", "index.html"))
-			return
-		}
-		if strings.Contains(r.URL.Path, "..") {
-			http.NotFound(w, r)
-			return
-		}
-		rel := strings.TrimPrefix(r.URL.Path, "/")
-		fullPath := filepath.Join(baseDir, "static", rel)
-		staticDir := filepath.Join(baseDir, "static")
-		if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(staticDir)) {
-			http.NotFound(w, r)
-			return
-		}
-		http.ServeFile(w, r, fullPath)
-	}
-}
-
-=======
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
 func main() {
-	flagPort := flag.Int("p", 3400, "Port")
-	flagDebug := flag.Bool("debug", false, "Debug mode")
-	flagKey := flag.String("key", "", "SSH known_hosts path")
-	flagKnock := flag.String("knock", "", "X-Knock header value")
-	flagHTTP3 := flag.Bool("http3", false, "Enable HTTP/3")
-	flagHelp := flag.Bool("h", false, "Help")
+	flagPort := flag.Int("p", 3400, "Port to listen on")
+	flagDebug := flag.Bool("debug", false, "Enable debug mode (logs to debug.log)")
+	flagKey := flag.String("key", "", "Path to SSH known_hosts file for host key verification")
+	flagHTML3 := flag.Bool("html3", false, "Enable HTML3-compatible mode for legacy/text-based browsers")
+	flagDoH := flag.String("doh", "", "DNS-over-HTTPS resolver URL (e.g., https://dns.cloudflare.com/dns-query)")
+	flagProxy := flag.String("proxy", "", "SOCKS5 proxy address (e.g., 127.0.0.1:9050)")
+	flagHelp := flag.Bool("h", false, "Show help message")
 
 	flag.Usage = printUsage
 	flag.Parse()
+
 	if *flagHelp {
 		printUsage()
 	}
 
 	debugMode = *flagDebug
-	knockHeader = *flagKnock
+	html3Mode = *flagHTML3
 
-	exePath, _ := os.Executable()
+	exePath, err := os.Executable()
+	if err != nil {
+		logger.Error("cannot get executable path", "error", err)
+		os.Exit(1)
+	}
 	baseDir := filepath.Dir(exePath)
-<<<<<<< HEAD
-	EnsureDirs(baseDir)
-=======
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
+
+	// --- Structured logger setup with slog (Go 1.26) ---
+	logLevel := new(slog.LevelVar)
+	logLevel.Set(slog.LevelInfo)
+	loggerOpts := &slog.HandlerOptions{Level: logLevel}
+	logger = slog.New(slog.NewTextHandler(os.Stdout, loggerOpts))
+
+	debugLog = logger
+	if debugMode {
+		logLevel.Set(slog.LevelDebug)
+		logFilePath := filepath.Join(baseDir, "debug.log")
+		logFile, ferr := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if ferr != nil {
+			logger.Warn("could not create debug.log", "error", ferr)
+		} else {
+			debugLog = slog.New(slog.NewTextHandler(io.MultiWriter(os.Stdout, logFile),
+				&slog.HandlerOptions{Level: slog.LevelDebug}))
+			debugLog.Info("debug mode enabled")
+		}
+	}
+
+	logger.Info("starting WebSSH",
+		"go_version", runtime.Version(),
+		"port", *flagPort,
+		"debug", debugMode,
+		"html3", html3Mode,
+		"doh", *flagDoH,
+		"proxy", *flagProxy,
+	)
+
+	// Load webssh.conf defaults for the browser form
+	loadWebSSHConfig(filepath.Join(baseDir, "webssh.conf"))
+
+	// Load access config
+	accessPath := filepath.Join(baseDir, "access.json")
+	if err := loadAccessConfig(accessPath); err != nil {
+		logger.Warn("could not load access.json, allowing all IPs", "error", err)
+		accessConf = AccessConfig{AllowedIPs: []string{"*"}}
+	} else {
+		debugLog.Debug("access config loaded", "allowed_ips", len(accessConf.AllowedIPs))
+	}
+
+	// Load proxy config (merged with CLI flags)
+	proxyPath := filepath.Join(baseDir, "proxy.json")
+	if err := loadProxyConfig(proxyPath); err != nil {
+		logger.Warn("could not load proxy.json, continuing with defaults", "error", err)
+	}
+	// CLI flags override proxy.json values.
+	if *flagDoH != "" {
+		proxyConf.DoH = *flagDoH
+	}
+	if *flagProxy != "" {
+		proxyConf.SOCKS5 = *flagProxy
+	}
+	debugLog.Debug("proxy config", "doh", proxyConf.DoH, "socks5", proxyConf.SOCKS5,
+		"direct_ips", proxyConf.DirectIPs, "alt_ports", proxyConf.AltPorts)
 
 	// SSH host key verification
 	if *flagKey != "" {
-		cb, err := knownhosts.New(*flagKey)
-		if err != nil {
-			log.Printf("Warning: known_hosts load failed: %v", err)
-			knownHosts = ssh.InsecureIgnoreHostKey()
+		hostKeyCallback, kerr := knownhosts.New(*flagKey)
+		if kerr != nil {
+			logger.Warn("could not load known_hosts, falling back to insecure verification", "path", *flagKey, "error", kerr)
+			knownHostsFn = ssh.InsecureIgnoreHostKey()
 		} else {
-			knownHosts = cb
-			log.Printf("SSH host key verification enabled: %s", *flagKey)
+			knownHostsFn = hostKeyCallback
+			logger.Info("SSH host key verification enabled", "path", *flagKey)
 		}
 	} else {
-		log.Printf("Warning: SSH host key verification DISABLED")
-		knownHosts = ssh.InsecureIgnoreHostKey()
+		logger.Warn("SSH host key verification disabled (use -key to enable)")
+		knownHostsFn = ssh.InsecureIgnoreHostKey()
 	}
 
-<<<<<<< HEAD
-	// Debug logging (Go 1.21+ slog is available but we use standard log for simplicity)
-=======
-	// Debug logging
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
-	if debugMode {
-		logFile, err := os.OpenFile(filepath.Join(baseDir, "debug.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err == nil {
-			debugLog = log.New(logFile, "[DEBUG] ", log.Ldate|log.Ltime)
-			log.SetOutput(io.MultiWriter(os.Stdout, logFile))
-		}
-	}
+	// --- HTTP route registration ---
+	mux := http.NewServeMux()
 
-	// Access config
-<<<<<<< HEAD
-	accessCfg := LoadAccessConfig(baseDir)
-
-	// Handlers with middleware chain
-	rootFileHandler := staticFileHandler(baseDir)
-	rootHandler := securityMiddleware(ipMiddleware(accessCfg,
-		knockMiddleware(masqueradeMiddleware(rootFileHandler)),
-	))
-
-	wsHandler := handleWebSocket
-	wsHandler = securityMiddleware(ipMiddleware(accessCfg,
-		knockMiddleware(masqueradeMiddleware(wsHandler)),
-	))
-
-=======
-	accessPath := filepath.Join(baseDir, "access.json")
-	if err := loadAccessConfig(accessPath); err != nil {
-		log.Printf("Warning: access.json not loaded: %v", err)
-		accessConfig = AccessConfig{AllowedIPs: []string{"*"}}
-	}
-
-	// Handlers with middleware chain
-	rootHandler := securityMiddleware(ipMiddleware(knockMiddleware(masqueradeMiddleware(
-		func(w http.ResponseWriter, r *http.Request) {
+	if html3Mode {
+		// HTML3 mode — separate handler
+		mux.HandleFunc("/html3", securityMiddleware(ipMiddleware(handleHTML3)))
+		// Still serve static assets for fallback
+		mux.HandleFunc("/", securityMiddleware(ipMiddleware(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/" {
-				http.ServeFile(w, r, filepath.Join(baseDir, "static", "index.html"))
+				http.Redirect(w, r, "/html3", http.StatusFound)
 				return
 			}
-			if strings.Contains(r.URL.Path, "..") {
+			if strings.Contains(r.URL.Path, "..") || !strings.HasPrefix(r.URL.Path, "/") {
 				http.NotFound(w, r)
 				return
 			}
@@ -593,94 +940,98 @@ func main() {
 				return
 			}
 			http.ServeFile(w, r, fullPath)
+		})))
+	} else {
+		// Normal mode — full terminal UI
+		mux.HandleFunc("/", securityMiddleware(ipMiddleware(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" {
+				http.ServeFile(w, r, filepath.Join(baseDir, "static", "index.html"))
+				return
+			}
+			if strings.Contains(r.URL.Path, "..") || !strings.HasPrefix(r.URL.Path, "/") {
+				http.NotFound(w, r)
+				return
+			}
+			rel := strings.TrimPrefix(r.URL.Path, "/")
+			fullPath := filepath.Join(baseDir, "static", rel)
+			staticDir := filepath.Join(baseDir, "static")
+			if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(staticDir)) {
+				http.NotFound(w, r)
+				return
+			}
+			http.ServeFile(w, r, fullPath)
+		})))
+	}
+
+	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(websshConf)
+	})
+
+	mux.HandleFunc("/ws", securityMiddleware(ipMiddleware(handleWebSocket)))
+
+	// --- TLS configuration ---
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
 		},
-	))))
-
-	wsHandler := securityMiddleware(ipMiddleware(knockMiddleware(masqueradeMiddleware(handleWebSocket))))
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/ws", wsHandler)
-
-	port := fmt.Sprintf(":%d", *flagPort)
-	certFile := filepath.Join(baseDir, "cert.pem")
-	keyFile := filepath.Join(baseDir, "key.pem")
-
-	certExists := fileExists(certFile)
-	keyExists := fileExists(keyFile)
+		SessionTicketsDisabled:   true,
+		PreferServerCipherSuites: true,
+	}
 
 	server := &http.Server{
-		Addr:           port,
-		Handler:        nil,
+		Addr:           fmt.Sprintf(":%d", *flagPort),
+		Handler:        mux,
+		TLSConfig:      tlsConfig,
 		ReadTimeout:    30 * time.Second,
 		WriteTimeout:   30 * time.Second,
 		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
 
+	// Graceful shutdown on SIGINT/SIGTERM.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	if certExists && keyExists {
-		log.Printf("Starting HTTPS on https://localhost%s", port)
-		tlsCfg, err := createHardenedTLSConfig(certFile, keyFile)
-		if err != nil {
-			log.Fatalf("TLS config error: %v", err)
-		}
-		server.TLSConfig = tlsCfg
+	certFile := filepath.Join(baseDir, "cert.pem")
+	keyFile := filepath.Join(baseDir, "key.pem")
 
-		// HTTPS server
+	_, certExists := os.Stat(certFile)
+	_, keyExists := os.Stat(keyFile)
+
+	if certExists == nil && keyExists == nil {
+		logger.Info("starting with TLS", "addr", server.Addr)
 		go func() {
-			ln, err := net.Listen("tcp", port)
-			if err != nil {
-				log.Fatalf("Listen error: %v", err)
-			}
-			defer ln.Close()
-			tlsLn := tls.NewListener(ln, tlsCfg)
-			if err := server.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("Server error: %v", err)
+			if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("server error", "error", err)
+				os.Exit(1)
 			}
 		}()
-
-<<<<<<< HEAD
-		// HTTP/3 (experimental)
-=======
-		// HTTP/3 (optional)
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
-		if *flagHTTP3 {
-			go func() {
-				if err := serveHTTP3(port, server.Handler, certFile, keyFile); err != nil {
-					log.Printf("HTTP/3 error (optional): %v", err)
-				}
-			}()
-			log.Println("HTTP/3 enabled (experimental)")
-		}
-<<<<<<< HEAD
-=======
-
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e
 	} else {
-		log.Printf("WARNING: No TLS certs found, starting HTTP on http://localhost%s", port)
-		log.Printf("Generate certs: openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes")
+		logger.Warn("TLS certificates not found, starting without encryption",
+			"cert", certFile, "key", keyFile)
+		logger.Warn("generate with: openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes")
 		go func() {
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("Server error: %v", err)
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("server error", "error", err)
+				os.Exit(1)
 			}
 		}()
 	}
 
 	<-stop
-	log.Println("Shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = server.Shutdown(ctx)
-	log.Println("Stopped")
-<<<<<<< HEAD
-}
-=======
-}
+	logger.Info("shutting down gracefully...")
 
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("forced shutdown", "error", err)
+	}
+	logger.Info("server stopped")
 }
->>>>>>> 9bb450314f58ac9dbdd47e76d8a0087faa53b67e

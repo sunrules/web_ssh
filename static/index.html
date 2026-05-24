@@ -5,12 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Web SSH Client</title>
     <link rel="stylesheet" href="/style.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 </head>
 <body>
     <div class="container">
         <div id="login-form" class="login-form">
-            <h2>SSH Connection</h2>
+            <h2>WebSSH Terminal</h2>
+            <p class="version-info">Go 1.26 · DoH · SOCKS5 · WSS</p>
             <form id="ssh-form">
                 <input type="text" id="host" placeholder="Host (e.g., localhost)" value="localhost" required>
                 <input type="number" id="port" placeholder="Port" value="2222" required>
@@ -32,15 +33,8 @@
         </div>
     </div>
     
-    <!-- xterm.js via importmap for ES module compatibility -->
-    <script type="importmap">
-    {
-        "imports": {
-            "@xterm/xterm": "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.mjs",
-            "@xterm/addon-fit": "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.mjs"
-        }
-    }
-    </script>
-    <script type="module" src="/script.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <script src="/script.js"></script>
 </body>
 </html>

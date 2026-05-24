@@ -1,19 +1,35 @@
-# Built binary
+# Go
+*.exe
+*.exe~
+*.test
+*.out
+
+# Build artifacts
 webssh
-web_ssh.exe
 webssh.exe
 
-# Debug logs
+# Runtime
 debug.log
 
-# TLS certificates
-key.pem
+# User config (credentials, IPs, etc.)
+access.json
+proxy.json
+webssh.conf
+
+# TLS
 cert.pem
+key.pem
 
 # IDE
-.vscode/
-.idea/
-.clinerules/
+.vscode
+.idea
 
-# Git
-.git/
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+temp/
+
+# Cline
+.clinerules/
