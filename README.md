@@ -1,33 +1,31 @@
 # WebSSH — Web-терминал для SSH через браузер
 
 **WebSSH** — это веб-приложение на Go, которое предоставляет терминал SSH прямо в браузере через WebSocket.  
-Разработано для безопасного удалённого управления серверами без установки дополнительного ПО на клиентской машине.
+Разработано для безопасного удалённого управления серверами в условиях сетевых ограничений.
 
 ## Возможности
 
-- **Полноценный SSH-терминал** в браузере через WebSocket.
-- **Два режима работы:**
-  - **Стандартный** — полнофункциональный терминал с xterm.js (цвета, копирование/вставка, ресайз).
-  - **HTML3** (`-html3`) — для текстовых/legacy-браузеров, совместимость с HTML 3.2.
-- **Структурированное логирование** через `slog` с уровнями и поддержкой debug-режима.
+- **Полноценный SSH-терминал** в браузере через WebSocket + xterm.js (поддержка mc, vim, nano, цветов).
+- **Структурированное логирование** через `slog` с уровнями Info / Warn / Debug.
 - **IP-контроль доступа** — белый список IP/подсетей через `access.json`.
 - **TLS 1.2/1.3** — автоматическое включение при наличии сертификатов.
 - **Graceful shutdown** — корректное завершение сессий при перезапуске.
 - **Настройки по умолчанию** — host/port из `webssh.conf` подставляются в форму браузера.
+- **Буфер обмена** — Ctrl+C / Ctrl+V / правая кнопка мыши (копирование/вставка).
+- **Поддержка ресайза** — терминал автоматически подстраивается под размер окна.
 
-## Обход блокировок (РКН/DDoS-Guard)
+## Обход блокировок (РКН / DDoS-Guard)
 
-Встроенные механизмы для работы в условиях сетевых ограничений:
-
-| Механизм | Описание | Флаг/Файл |
+| Механизм | Описание | Настройка |
 |---|---|---|
-| **DNS-over-HTTPS (DoH)** | Шифрованные DNS-запросы через Cloudflare, Google и др. | `-doh URL` |
-| **SOCKS5-прокси** | Маршрутизация SSH через Tor, Shadowsocks, ProxyChains | `-proxy addr` |
+| **DNS-over-HTTPS (DoH)** | Шифрованные DNS-запросы (Cloudflare, Google) | `-doh URL` |
+| **SOCKS5-прокси** | Маршрутизация SSH через Tor, Shadowsocks | `-proxy addr` |
+| **Obfuscated SSH** | Маскировка SSH-трафика: XOR + fake HTTP-баннер | `proxy.json` → `obfs_secret` |
+| **Fallback** | Автоматический откат на plain-соединение при EOF | Встроено |
 | **Прямые IP-адреса** | Подключение напрямую по IP, минуя DNS-блокировки | `proxy.json` → `direct_ips` |
-| **Альтернативные порты** | Подключение по нестандартным портам (2222, 22222 и т.д.) | `proxy.json` → `alt_ports` |
-| **Автоматический перебор** | Последовательный перебор всех комбинаций: IP и порты | Встроено по умолчанию |
+| **Альтернативные порты** | Подключение по нестандартным портам (2222, 22222) | `proxy.json` → `alt_ports` |
+| **Автоматический перебор** | Последовательный перебор всех комбинаций | Встроено |
 | **Таймауты** | TCP dial (12с), SSH handshake (20с) | Встроено |
-| **TLS SNI (через reverse proxy)** | Обфускация SNI для WSS при использовании nginx/caddy | `proxy.json` → `sni_hostname` |
 
 ### Примеры обхода блокировок
 
@@ -38,8 +36,9 @@ webssh -doh https://dns.cloudflare.com/dns-query
 # DoH + Tor (SOCKS5)
 webssh -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050
 
-# Только Tor, без DoH
-webssh -proxy 127.0.0.1:9050
+# Всё вместе: DoH + Tor + Obfuscated SSH
+webssh -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050 -debug
+# + obfs_secret в proxy.json
 ```
 
 ## Быстрый старт
@@ -48,21 +47,17 @@ webssh -proxy 127.0.0.1:9050
 # Сборка
 go build -o webssh -ldflags "-s -w" .
 
-# Запуск на порту 3400 (по умолчанию)
+# Запуск на порту 3400
 ./webssh
 
 # С портом, debug, DoH и прокси
 ./webssh -p 8080 -debug -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050
 
-# Режим HTML3 для старых браузеров
-./webssh -html3
-
-# С верификацией SSH-ключей хостов
-./webssh -key ~/.ssh/known_hosts
-
 # Справка
 ./webssh -h
 ```
+
+После запуска откройте браузер на `http://localhost:3400` (или `https://localhost:3400` при TLS).
 
 ## Установка и сборка
 
@@ -85,7 +80,7 @@ GOOS=linux GOARCH=amd64 go build -o webssh -ldflags "-s -w" .
 
 ### Запуск как systemd-сервис на Linux
 
-Создать файл `/etc/systemd/system/webssh.service`:
+Файл `/etc/systemd/system/webssh.service`:
 
 ```ini
 [Unit]
@@ -122,6 +117,28 @@ host = 127.0.0.1
 port = 2222
 ```
 
+### `proxy.json` — настройки обхода блокировок (опционально)
+
+```json
+{
+  "socks5": "127.0.0.1:9050",
+  "doh": "https://dns.cloudflare.com/dns-query",
+  "direct_ips": ["198.51.100.1:22"],
+  "alt_ports": [2222, 22222],
+  "enable_tor": false,
+  "sni_hostname": "",
+  "obfs_secret": "vash-sekretnyy-kluch-32-simvola"
+}
+```
+
+CLI-флаги `-doh` и `-proxy` имеют приоритет над `proxy.json`.
+
+**`obfs_secret`** — секретный ключ для обфускации SSH-трафика:
+- При пустой строке (`""`) обфускация выключена
+- Любая строка от 1 символа включает маскировку SSH-протокола
+- Если сервер не поддерживает обфускацию, происходит автоматический fallback на plain
+- Рекомендуется: `openssl rand -base64 32`
+
 ### `access.json` — контроль доступа по IP
 
 ```json
@@ -138,21 +155,6 @@ port = 2222
 
 `"*"` — разрешить все IP. Если файла нет — используются `["*"]`.
 
-### `proxy.json` — настройки обхода блокировок (опционально)
-
-```json
-{
-  "socks5": "127.0.0.1:9050",
-  "doh": "https://dns.cloudflare.com/dns-query",
-  "direct_ips": ["198.51.100.1:22"],
-  "alt_ports": [2222, 22222],
-  "enable_tor": false,
-  "sni_hostname": "cloudflare.com"
-}
-```
-
-CLI-флаги `-doh` и `-proxy` имеют приоритет над `proxy.json`.
-
 ### `cert.pem` / `key.pem` — TLS-сертификаты
 
 Если сертификаты найдены — включится HTTPS (WSS).  
@@ -162,8 +164,8 @@ CLI-флаги `-doh` и `-proxy` имеют приоритет над `proxy.js
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
 ```
 
-**Без TLS вся трафик (включая пароли) передаётся в открытом виде!**
-Рекомендуется использовать nginx/caddy как reverse proxy с Let's Encrypt.
+**Без TLS весь трафик (включая пароли) передаётся в открытом виде!**
+Рекомендуется использовать nginx / Caddy как reverse proxy с Let's Encrypt.
 
 ## Использованные технологии Go 1.26
 
@@ -176,38 +178,37 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 
 ## .gitignore — что попадает в репозиторий
 
-Конфигурационные файлы с IP/логинами/паролями и TLS-сертификаты **не** включаются в git:
+Конфигурационные файлы с IP / логинами / паролями и TLS-сертификаты **не** включаются в git:
 
 | Файл | В git | Причина |
 |---|---|---|
 | `main.go` | ✅ | Исходный код |
 | `go.mod` / `go.sum` | ✅ | Зависимости |
-| `static/` | ✅ | Веб-интерфейс |
+| `static/` | ✅ | Веб-интерфейс (xterm.js) |
 | `README.md` | ✅ | Документация |
-| `webssh.service` | ✅ | Пример systemd unit |
 | `.gitignore` | ✅ | Правила игнорирования |
+| `webssh.service` | ✅ | Пример systemd unit |
 | `access.json` | ❌ | IP-адреса и сети |
 | `proxy.json` | ❌ | Адреса прокси и обхода |
 | `webssh.conf` | ❌ | Настройки подключения |
 | `cert.pem` / `key.pem` | ❌ | TLS-сертификаты |
 | `webssh` / `webssh.exe` | ❌ | Бинарник |
 | `debug.log` | ❌ | Логи |
-| `temp/` | ❌ | Временные файлы |
 
 ## Структура проекта
 
 ```
 web_ssh/
-├── main.go            # Основной сервер и SSH-мост (Go 1.26)
+├── main.go            # Сервер + SSH-мост + Obfuscation (Go 1.26)
 ├── go.mod             # Модуль и зависимости (в git)
 ├── go.sum             # Контрольные суммы (в git)
 ├── .gitignore         # Правила игнорирования (в git)
+├── README.md          # Этот файл (в git)
+├── webssh.service     # systemd unit (пример) (в git)
 ├── static/
 │   ├── index.html     # Веб-интерфейс (xterm.js) (в git)
 │   ├── script.js      # WebSocket-клиент (в git)
 │   └── style.css      # Стили (в git)
-├── webssh.service     # systemd unit (пример) (в git)
-├── README.md          # Этот файл (в git)
 ├── access.json        # IP-контроль доступа (НЕ в git)
 ├── proxy.json         # Настройки обхода блокировок (НЕ в git)
 ├── webssh.conf        # Настройки формы по умолчанию (НЕ в git)
@@ -225,7 +226,7 @@ git status
 git add .
 
 # Создать коммит
-git commit -m "refactor: Go 1.26, HTML3, DoH, SOCKS5, webssh.conf"
+git commit -m "refactor: Go 1.26, Obfuscated SSH, xterm.js, DoH, SOCKS5, /config"
 
 # Отправить на GitHub
 git push origin main
