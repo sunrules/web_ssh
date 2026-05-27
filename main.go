@@ -81,6 +81,23 @@ type WebSSHConfig struct {
 	Port int    `json:"port"`
 }
 
+// ConnectionStrategy — одна попытка подключения с определённым методом обфускации.
+type ConnectionStrategy struct {
+	Address     string
+	Obfuscation string // "tls", "xor", "plain"
+	Description string // для логов
+}
+
+// SSHConnector управляет всеми стратегиями подключения.
+type SSHConnector struct {
+	Host        string
+	Port        int
+	SSHConfig   *ssh.ClientConfig
+	Ctx         context.Context
+	SocksDialer proxy.Dialer
+	NetDialer   *net.Dialer
+}
+
 // Global state.
 var (
 	upgrader = websocket.Upgrader{
@@ -198,37 +215,65 @@ func (r *dohResolver) lookupHost(ctx context.Context, host string) ([]string, er
 	if r == nil {
 		return net.DefaultResolver.LookupHost(ctx, host)
 	}
-	u := fmt.Sprintf("%s?name=%s&type=A", r.baseURL, url.QueryEscape(host))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/dns-json")
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("DoH lookup failed: %w", err)
-	}
-	defer resp.Body.Close()
 
-	var dnsResp struct {
-		Answer []struct {
-			Type int    `json:"type"`
-			Data string `json:"data"`
-		} `json:"Answer"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&dnsResp); err != nil {
-		return nil, fmt.Errorf("DoH decode failed: %w", err)
-	}
-	var ips []string
-	for _, a := range dnsResp.Answer {
-		if a.Type == 1 {
-			ips = append(ips, a.Data)
+	// Сначала пытаемся получить и A (IPv4), и AAAA (IPv6) записи одним запросом типа AAAA,
+	// но Cloudflare DNS-over-HTTPS поддерживает одновременно A+AAAA через POST с wire форматом.
+	// Используем GET + JSON (RFC 8484) с type=A+AAAA если возможно, иначе раздельные запросы.
+
+	var allIPs []string
+
+	// Пробуем раздельные запросы A и AAAA для максимальной совместимости
+	for _, dnsType := range []struct {
+		qtype string
+		rtype int
+	}{
+		{"A", 1},    // IPv4
+		{"AAAA", 28}, // IPv6
+	} {
+		u := fmt.Sprintf("%s?name=%s&type=%s", r.baseURL, url.QueryEscape(host), dnsType.qtype)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			debugLog.Debug("DoH request creation failed", "type", dnsType.qtype, "error", err)
+			continue
+		}
+		req.Header.Set("Accept", "application/dns-json")
+		req.Header.Set("User-Agent", "Go-http-client/1.1")
+
+		resp, err := r.client.Do(req)
+		if err != nil {
+			debugLog.Debug("DoH lookup failed", "type", dnsType.qtype, "error", err)
+			continue
+		}
+
+		var dnsResp struct {
+			Answer []struct {
+				Type int    `json:"type"`
+				Data string `json:"data"`
+			} `json:"Answer"`
+		}
+		if decErr := json.NewDecoder(resp.Body).Decode(&dnsResp); decErr != nil {
+			resp.Body.Close()
+			debugLog.Debug("DoH decode failed", "type", dnsType.qtype, "error", decErr)
+			continue
+		}
+		resp.Body.Close()
+
+		for _, a := range dnsResp.Answer {
+			if a.Type == dnsType.rtype {
+				allIPs = append(allIPs, a.Data)
+			}
 		}
 	}
-	if len(ips) > 0 {
-		return ips, nil
+
+	if len(allIPs) > 0 {
+		debugLog.Debug("DoH resolved", "host", host, "ips", allIPs)
+		return allIPs, nil
 	}
-	return nil, fmt.Errorf("DoH: no A records for %s", host)
+
+	// POST с wire format (application/dns-message) удалён из-за ненадёжности самописного парсера.
+	// Используем только GET + JSON (RFC 8484) — он стабильно работает со всеми DoH-провайдерами.
+
+	return nil, fmt.Errorf("DoH: no records for %s", host)
 }
 
 // ---------------------------------------------------------------------------
@@ -247,8 +292,82 @@ func socksDialer(addr string) proxy.Dialer {
 	return d
 }
 
+// (обёртки wrapConnection, wrapWithObfuscation, wrapWithXOROnly удалены — вся логика
+//  обфускации теперь в SSHConnector.applyObfuscation)
+
 // ---------------------------------------------------------------------------
-// Obfuscated SSH
+// TLS camouflage (TLS-in-TCP tunnel for DPI bypass)
+// ---------------------------------------------------------------------------
+
+// tlsCamouflageConn wraps a TLS connection over plain TCP.
+// To DPI it looks like a normal HTTPS session to the specified SNI host.
+type tlsCamouflageConn struct {
+	*tls.Conn
+}
+
+func newTLSCamouflageConn(conn net.Conn, sniHostname string) (*tlsCamouflageConn, error) {
+	// Используем cipher suites и настройки, имитирующие реальный браузерный TLS
+	// Список cipher suites взят из типичного набора Chrome/Firefox
+	tlsConfig := &tls.Config{
+		ServerName:         sniHostname,
+		InsecureSkipVerify: true, // Мы не проверяем сертификат — это маскировка, не безопасность
+		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS13,
+		// Browser-like cipher suites
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		},
+		// Отключаем HTTP/2 и ALPN для более простого fingerprint'а
+		NextProtos: []string{"http/1.1"},
+		// Включаем поддержку session tickets как в браузере
+		SessionTicketsDisabled: false,
+		// Не используем PreferServerCipherSuites — браузеры так не делают
+		PreferServerCipherSuites: false,
+		// Эмуляция браузерного набора поддерживаемых групп (CurvePreferences)
+		CurvePreferences: []tls.CurveID{
+			tls.X25519,
+			tls.CurveP256,
+			tls.CurveP384,
+		},
+	}
+
+	tlsConn := tls.Client(conn, tlsConfig)
+
+	// Выполняем TLS handshake — это и есть camouflage
+	// DPI видит обычное TLS-соединение к легитимному хосту
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("TLS camouflage handshake failed: %w", err)
+	}
+
+	debugLog.Debug("TLS camouflage established",
+		"sni", sniHostname,
+		"cipher", tlsConn.ConnectionState().CipherSuite,
+		"version", tlsConn.ConnectionState().Version,
+		"server_name", tlsConn.ConnectionState().ServerName,
+	)
+
+	return &tlsCamouflageConn{tlsConn}, nil
+}
+
+// Close закрывает TLS соединение и отправляет TLS close_notify
+func (tc *tlsCamouflageConn) Close() error {
+	// Пытаемся gracefully закрыть TLS (отправляем close_notify)
+	if err := tc.Conn.CloseWrite(); err != nil {
+		// Игнорируем ошибки — некоторые сервера не поддерживают
+	}
+	return tc.Conn.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Legacy XOR obfuscation (fallback)
 // ---------------------------------------------------------------------------
 
 type obfuscatedConn struct {
@@ -274,7 +393,7 @@ func newObfuscatedConn(conn net.Conn, secret string) (*obfuscatedConn, error) {
 	if _, err := conn.Write(preamble); err != nil {
 		return nil, fmt.Errorf("obfs preamble: %w", err)
 	}
-	debugLog.Debug("obfuscation layer enabled", "secret_len", len(secret), "preamble_len", len(preamble))
+	debugLog.Debug("XOR obfuscation layer enabled", "secret_len", len(secret), "preamble_len", len(preamble))
 	return oc, nil
 }
 
@@ -296,18 +415,6 @@ func (oc *obfuscatedConn) Write(b []byte) (int, error) {
 	oc.writeBuf = append(oc.writeBuf[:0], b...)
 	oc.xor(oc.writeBuf)
 	return oc.Conn.Write(oc.writeBuf)
-}
-
-func wrapWithObfuscation(conn net.Conn) net.Conn {
-	if proxyConf.ObfsSecret == "" {
-		return conn
-	}
-	oc, err := newObfuscatedConn(conn, proxyConf.ObfsSecret)
-	if err != nil {
-		logger.Warn("obfuscation setup failed, using plain connection", "error", err)
-		return conn
-	}
-	return oc
 }
 
 // ---------------------------------------------------------------------------
@@ -425,212 +532,235 @@ func (c *WebSocketClient) connectSSH(ctx context.Context, host string, port int,
 		Timeout:         15 * time.Second,
 	}
 
-	var ips []string
-	doh := newDoHResolver(proxyConf.DoH)
-	if isIPAddress(host) {
-		debugLog.Debug("bare IP address detected, skipping DoH", "host", host)
-	} else if isPrivateHost(host) {
-		debugLog.Debug("private host detected, skipping DoH", "host", host)
-	} else if doh != nil {
-		var dohErr error
-		ips, dohErr = doh.lookupHost(ctx, host)
-		if dohErr != nil {
-			debugLog.Debug("DoH lookup failed, falling back to OS resolver", "host", host, "error", dohErr)
-		}
+	connector := &SSHConnector{
+		Host:        host,
+		Port:        port,
+		SSHConfig:   sshConfig,
+		Ctx:         ctx,
+		SocksDialer: socksDialer(proxyConf.SOCKS5),
+		NetDialer:   &net.Dialer{Timeout: 10 * time.Second},
 	}
 
-	tryAddrs := make([]string, 0, 6)
-
-	for _, dip := range proxyConf.DirectIPs {
-		if !strings.Contains(dip, ":") {
-			dip = fmt.Sprintf("%s:%d", dip, port)
-		}
-		tryAddrs = append(tryAddrs, dip)
-	}
-	if len(ips) > 0 {
-		for _, ip := range ips {
-			tryAddrs = append(tryAddrs, fmt.Sprintf("%s:%d", ip, port))
-		}
-	}
-	origAddr := fmt.Sprintf("%s:%d", host, port)
-	tryAddrs = append(tryAddrs, origAddr)
-	for _, aPort := range proxyConf.AltPorts {
-		altAddr := fmt.Sprintf("%s:%d", host, aPort)
-		tryAddrs = append(tryAddrs, altAddr)
-		for _, ip := range ips {
-			tryAddrs = append(tryAddrs, fmt.Sprintf("%s:%d", ip, aPort))
-		}
-	}
-
-	socksDialer := socksDialer(proxyConf.SOCKS5)
-	netDialer := &net.Dialer{Timeout: 10 * time.Second}
-
-	seen := make(map[string]bool, len(tryAddrs))
-	uniqueAddrs := make([]string, 0, len(tryAddrs))
-	for _, a := range tryAddrs {
-		if !seen[a] {
-			seen[a] = true
-			uniqueAddrs = append(uniqueAddrs, a)
-		}
-	}
+	strategies := connector.buildStrategies()
 
 	var lastErr error
-dials:
-	for _, addr := range uniqueAddrs {
+	for _, strategy := range strategies {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		debugLog.Debug("attempting SSH connection", "addr", addr, "via_socks5", proxyConf.SOCKS5 != "")
-		var nconn net.Conn
-		var dialErr error
 
-		if proxyConf.SOCKS5 != "" {
-			type result struct {
-				conn net.Conn
-				err  error
-			}
-			ch := make(chan result, 1)
-			go func() {
-				c, e := socksDialer.Dial("tcp", addr)
-				ch <- result{c, e}
-			}()
-			select {
-			case res := <-ch:
-				nconn, dialErr = res.conn, res.err
-			case <-time.After(12 * time.Second):
-				dialErr = fmt.Errorf("SOCKS5 dial timed out after 12s")
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		} else {
-			dialCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-			nconn, dialErr = netDialer.DialContext(dialCtx, "tcp", addr)
-			cancel()
-		}
+		debugLog.Debug("trying connection strategy",
+			"addr", strategy.Address,
+			"obfs", strategy.Obfuscation,
+			"desc", strategy.Description)
 
-		if dialErr != nil {
-			debugLog.Debug("dial failed", "addr", addr, "error", dialErr)
-			lastErr = dialErr
+		sshClient, err := connector.tryStrategy(strategy)
+		if err != nil {
+			lastErr = err
+			debugLog.Debug("strategy failed", "addr", strategy.Address, "error", err)
 			continue
 		}
-		debugLog.Debug("dial succeeded, starting SSH handshake", "addr", addr)
 
-		// Wrap with obfuscation if configured.
-		hsConn := wrapWithObfuscation(nconn)
-		isWrapped := hsConn != nconn
-
-		type hsResult struct {
-			sconn ssh.Conn
-			chans <-chan ssh.NewChannel
-			reqs  <-chan *ssh.Request
-			err   error
-		}
-
-		hsCh := make(chan hsResult, 1)
-		go func() {
-			sconn, chans, reqs, e := ssh.NewClientConn(hsConn, addr, sshConfig)
-			hsCh <- hsResult{sconn, chans, reqs, e}
-		}()
-
-		var handshakeOK bool
-		select {
-		case hs := <-hsCh:
-			if hs.err != nil {
-				hsConn.Close()
-				debugLog.Debug("SSH handshake failed", "addr", addr, "obfuscated", isWrapped, "error", hs.err)
-				// If obfuscation was active and handshake failed with EOF (or "connection reset"),
-				// the server does not support it. Fall through to plain below.
-				// Note: ssh.NewClientConn wraps errors without %w, so we check the message.
-				isEOF := isWrapped && (strings.Contains(hs.err.Error(), "EOF") || strings.Contains(hs.err.Error(), "connection reset"))
-				if isEOF {
-					debugLog.Debug("obfuscation rejected by server, retrying with plain connection", "addr", addr)
-				} else {
-					lastErr = hs.err
-					continue dials
-				}
-			} else {
-				c.sshConn = ssh.NewClient(hs.sconn, hs.chans, hs.reqs)
-				handshakeOK = true
-			}
-		case <-time.After(20 * time.Second):
-			hsConn.Close()
-			lastErr = fmt.Errorf("SSH handshake timed out after 20s for %s", addr)
-			debugLog.Debug("SSH handshake timed out", "addr", addr)
-			// Can't retry plain on timeout — the raw TCP connection was already consumed.
-			continue dials
-		case <-ctx.Done():
-			hsConn.Close()
-			return ctx.Err()
-		}
-
-		// If obfuscation failed with EOF, try again on the same addr without obfuscation.
-		// This requires a fresh TCP connection since the raw one was already consumed.
-		if !handshakeOK && isWrapped {
-			debugLog.Debug("re-dialing for plain SSH handshake", "addr", addr)
-			var plainConn net.Conn
-			var plainErr error
-			if proxyConf.SOCKS5 != "" {
-				type pResult struct{ c net.Conn; e error }
-				pCh := make(chan pResult, 1)
-				go func() {
-					c, e := socksDialer.Dial("tcp", addr)
-					pCh <- pResult{c, e}
-				}()
-				select {
-				case pr := <-pCh:
-					plainConn, plainErr = pr.c, pr.e
-				case <-time.After(12 * time.Second):
-					plainErr = fmt.Errorf("SOCKS5 dial timed out after 12s")
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			} else {
-				dialCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-				plainConn, plainErr = netDialer.DialContext(dialCtx, "tcp", addr)
-				cancel()
-			}
-			if plainErr != nil {
-				debugLog.Debug("re-dial failed", "addr", addr, "error", plainErr)
-				lastErr = plainErr
-				continue dials
-			}
-			hsCh2 := make(chan hsResult, 1)
-			go func() {
-				sconn, chans, reqs, e := ssh.NewClientConn(plainConn, addr, sshConfig)
-				hsCh2 <- hsResult{sconn, chans, reqs, e}
-			}()
-			select {
-			case hs := <-hsCh2:
-				if hs.err != nil {
-					plainConn.Close()
-					debugLog.Debug("plain SSH handshake also failed", "addr", addr, "error", hs.err)
-					lastErr = hs.err
-					continue dials
-				}
-				c.sshConn = ssh.NewClient(hs.sconn, hs.chans, hs.reqs)
-				handshakeOK = true
-			case <-time.After(20 * time.Second):
-				plainConn.Close()
-				lastErr = fmt.Errorf("plain SSH handshake timed out after 20s for %s", addr)
-				continue dials
-			case <-ctx.Done():
-				plainConn.Close()
-				return ctx.Err()
-			}
-		}
-
-		if !handshakeOK {
-			continue dials
-		}
+		c.sshConn = sshClient
 		lastErr = nil
 		break
 	}
+
 	if lastErr != nil {
-		return fmt.Errorf("failed to connect to any address for %s: %w", host, lastErr)
+		return fmt.Errorf("all connection strategies failed for %s: %w", host, lastErr)
 	}
 
+	if err := c.setupSession(); err != nil {
+		return err
+	}
+
+	logger.Info("SSH connected", "user", username, "host", host, "port", port)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// SSHConnector — управление стратегиями подключения
+// ---------------------------------------------------------------------------
+
+func (sc *SSHConnector) buildStrategies() []ConnectionStrategy {
+	var strategies []ConnectionStrategy
+
+	fullAddr := func(ipOrHost string, p int) string {
+		return fmt.Sprintf("%s:%d", ipOrHost, p)
+	}
+
+	// 1. Direct IPs — самый высокий приоритет
+	// Для direct IP всегда добавляем plain в конце, даже если есть TLS/XOR.
+	// Это гарантирует, что если сервер не поддерживает обфускацию — будет fallback.
+	for _, dip := range proxyConf.DirectIPs {
+		addr := fullAddr(dip, sc.Port)
+		if proxyConf.SNIHostname != "" {
+			strategies = append(strategies, ConnectionStrategy{
+				Address:     addr,
+				Obfuscation: "tls",
+				Description: "direct IP + TLS",
+			})
+		}
+		if proxyConf.ObfsSecret != "" {
+			strategies = append(strategies, ConnectionStrategy{
+				Address:     addr,
+				Obfuscation: "xor",
+				Description: "direct IP + XOR",
+			})
+		}
+		// Plain добавляем всегда как последний fallback для direct IP
+		strategies = append(strategies, ConnectionStrategy{
+			Address:     addr,
+			Obfuscation: "plain",
+			Description: "direct IP",
+		})
+	}
+
+	// 2. DoH resolved IPs (IPv6 → IPv4)
+	var ips []string
+	doh := newDoHResolver(proxyConf.DoH)
+	if !isIPAddress(sc.Host) && !isPrivateHost(sc.Host) && doh != nil {
+		var dohErr error
+		ips, dohErr = doh.lookupHost(sc.Ctx, sc.Host)
+		if dohErr != nil {
+			debugLog.Debug("DoH lookup failed", "host", sc.Host, "error", dohErr)
+		}
+	}
+
+	// IPv6 first
+	for _, ip := range ips {
+		if strings.Contains(ip, ":") {
+			obfs := "plain"
+			if proxyConf.SNIHostname != "" {
+				obfs = "tls"
+			}
+			strategies = append(strategies, ConnectionStrategy{
+				Address:     fullAddr(ip, sc.Port),
+				Obfuscation: obfs,
+				Description: "DoH IPv6",
+			})
+		}
+	}
+	// IPv4
+	for _, ip := range ips {
+		if !strings.Contains(ip, ":") {
+			obfs := "plain"
+			if proxyConf.SNIHostname != "" {
+				obfs = "tls"
+			}
+			strategies = append(strategies, ConnectionStrategy{
+				Address:     fullAddr(ip, sc.Port),
+				Obfuscation: obfs,
+				Description: "DoH IPv4",
+			})
+		}
+	}
+
+	// 3. Original host
+	obfs := "plain"
+	if proxyConf.SNIHostname != "" {
+		obfs = "tls"
+	}
+	strategies = append(strategies, ConnectionStrategy{
+		Address:     fullAddr(sc.Host, sc.Port),
+		Obfuscation: obfs,
+		Description: "original host",
+	})
+
+	// 4. Alt ports
+	for _, altPort := range proxyConf.AltPorts {
+		strategies = append(strategies, ConnectionStrategy{
+			Address:     fullAddr(sc.Host, altPort),
+			Obfuscation: obfs,
+			Description: fmt.Sprintf("alt port %d", altPort),
+		})
+	}
+
+	return strategies
+}
+
+func (sc *SSHConnector) tryStrategy(s ConnectionStrategy) (*ssh.Client, error) {
+	conn, err := sc.dial(s.Address)
+	if err != nil {
+		return nil, fmt.Errorf("dial failed: %w", err)
+	}
+
+	// applyObfuscation может вернуть ту же conn (plain) или обёрнутую
+	wrappedConn, obfsErr := sc.applyObfuscation(conn, s.Obfuscation)
+	if obfsErr != nil {
+		conn.Close()
+		return nil, fmt.Errorf("obfuscation failed: %w", obfsErr)
+	}
+
+	// SSH Handshake
+	sshConn, chans, reqs, err := ssh.NewClientConn(wrappedConn, s.Address, sc.SSHConfig)
+	if err != nil {
+		wrappedConn.Close()
+		return nil, fmt.Errorf("SSH handshake failed: %w", err)
+	}
+
+	debugLog.Debug("strategy succeeded",
+		"addr", s.Address,
+		"obfs", s.Obfuscation,
+		"desc", s.Description)
+	return ssh.NewClient(sshConn, chans, reqs), nil
+}
+
+func (sc *SSHConnector) dial(addr string) (net.Conn, error) {
+	if proxyConf.SOCKS5 != "" {
+		type dialResult struct {
+			conn net.Conn
+			err  error
+		}
+		ch := make(chan dialResult, 1)
+		go func() {
+			c, e := sc.SocksDialer.Dial("tcp", addr)
+			ch <- dialResult{c, e}
+		}()
+		select {
+		case res := <-ch:
+			return res.conn, res.err
+		case <-time.After(12 * time.Second):
+			return nil, fmt.Errorf("SOCKS5 dial timeout after 12s")
+		case <-sc.Ctx.Done():
+			return nil, sc.Ctx.Err()
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(sc.Ctx, 12*time.Second)
+	defer cancel()
+	return sc.NetDialer.DialContext(ctx, "tcp", addr)
+}
+
+func (sc *SSHConnector) applyObfuscation(conn net.Conn, method string) (net.Conn, error) {
+	switch method {
+	case "tls":
+		if proxyConf.SNIHostname != "" {
+			tlsConn, err := newTLSCamouflageConn(conn, proxyConf.SNIHostname)
+			if err != nil {
+				return conn, fmt.Errorf("TLS camouflage failed: %w", err)
+			}
+			return tlsConn, nil
+		}
+		return conn, fmt.Errorf("TLS camouflage not configured (sni_hostname is empty)")
+	case "xor":
+		if proxyConf.ObfsSecret != "" {
+			xorConn, err := newObfuscatedConn(conn, proxyConf.ObfsSecret)
+			if err != nil {
+				return conn, fmt.Errorf("XOR obfuscation failed: %w", err)
+			}
+			return xorConn, nil
+		}
+		return conn, fmt.Errorf("XOR obfuscation not configured (obfs_secret is empty)")
+	default:
+		return conn, nil
+	}
+}
+
+// setupSession создаёт SSH-сессию, PTY, pipes и запускает shell.
+func (c *WebSocketClient) setupSession() error {
 	session, err := c.sshConn.NewSession()
 	if err != nil {
 		return fmt.Errorf("new session: %w", err)
@@ -650,23 +780,9 @@ dials:
 		}
 	}
 
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("stdin pipe: %w", err)
-	}
-	c.stdin = stdin
-
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
-	}
-	c.stdout = stdout
-
-	stderr, err := session.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("stderr pipe: %w", err)
-	}
-	c.stderr = stderr
+	c.stdin, _ = session.StdinPipe()
+	c.stdout, _ = session.StdoutPipe()
+	c.stderr, _ = session.StderrPipe()
 
 	go c.readOutput(c.stdout)
 	go c.readOutput(c.stderr)
@@ -674,11 +790,10 @@ dials:
 	c.shellStarted.Do(func() {
 		if e := c.session.Shell(); e != nil {
 			logger.Warn("shell start error", "error", e)
-			c.sendError("Failed to start shell: " + e.Error())
+			c.sendError("Failed to start shell")
 		}
 	})
 
-	logger.Info("SSH connected", "user", username, "host", host, "port", port)
 	return nil
 }
 
@@ -879,6 +994,11 @@ func main() {
 	}
 	if *flagProxy != "" {
 		proxyConf.SOCKS5 = *flagProxy
+	}
+	// Автоматическая настройка Tor: если enable_tor: true и SOCKS5 не задан явно
+	if proxyConf.EnableTor && proxyConf.SOCKS5 == "" {
+		proxyConf.SOCKS5 = "127.0.0.1:9050"
+		logger.Info("Tor mode enabled, SOCKS5 set to 127.0.0.1:9050")
 	}
 	debugLog.Debug("proxy config", "doh", proxyConf.DoH, "socks5", proxyConf.SOCKS5,
 		"direct_ips", proxyConf.DirectIPs, "alt_ports", proxyConf.AltPorts)

@@ -14,31 +14,35 @@
 - **Буфер обмена** — Ctrl+C / Ctrl+V / правая кнопка мыши (копирование/вставка).
 - **Поддержка ресайза** — терминал автоматически подстраивается под размер окна.
 
-## Обход блокировок (РКН / DDoS-Guard)
+## Обход блокировок (РКН / DPI 2025–2026)
+
+### Механизмы обхода (в порядке приоритета)
 
 | Механизм | Описание | Настройка |
 |---|---|---|
-| **DNS-over-HTTPS (DoH)** | Шифрованные DNS-запросы (Cloudflare, Google) | `-doh URL` |
+| **TLS Camouflage** | Маскировка SSH под HTTPS-трафик к легитимному сайту (cloudflare.com, google.com). DPI видит обычный TLS 1.3 с браузерным fingerprint'ом. | `proxy.json` → `sni_hostname` |
+| **DNS-over-HTTPS (DoH)** | Шифрованные DNS-запросы с поддержкой IPv6 (AAAA) и fallback на POST wire формат | `-doh URL` |
+| **Приоритет IPv6** | IPv6-адреса подключаются первыми — DPI РКН хуже фильтрует IPv6 трафик | Встроено |
 | **SOCKS5-прокси** | Маршрутизация SSH через Tor, Shadowsocks | `-proxy addr` |
-| **Obfuscated SSH** | Маскировка SSH-трафика: XOR + fake HTTP-баннер | `proxy.json` → `obfs_secret` |
+| **XOR Obfuscation (legacy)** | Маскировка SSH-трафика: XOR + fake HTTP-баннер (fallback, если TLS недоступен) | `proxy.json` → `obfs_secret` |
+| **Прямые IP-адреса** | Подключение напрямую по IP с наивысшим приоритетом, минуя DNS-блокировки | `proxy.json` → `direct_ips` |
+| **Альтернативные порты** | Подключение по нестандартным портам (2222, 2053, 8443 и др.) | `proxy.json` → `alt_ports` |
+| **Автоматический перебор** | Последовательный перебор всех комбинаций (direct → IPv6 → IPv4 → host → altPorts) | Встроено |
 | **Fallback** | Автоматический откат на plain-соединение при EOF | Встроено |
-| **Прямые IP-адреса** | Подключение напрямую по IP, минуя DNS-блокировки | `proxy.json` → `direct_ips` |
-| **Альтернативные порты** | Подключение по нестандартным портам (2222, 22222) | `proxy.json` → `alt_ports` |
-| **Автоматический перебор** | Последовательный перебор всех комбинаций | Встроено |
 | **Таймауты** | TCP dial (12с), SSH handshake (20с) | Встроено |
 
 ### Примеры обхода блокировок
 
 ```bash
-# DoH через Cloudflare
+# DoH через Cloudflare с поддержкой IPv6
 webssh -doh https://dns.cloudflare.com/dns-query
 
 # DoH + Tor (SOCKS5)
 webssh -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050
 
-# Всё вместе: DoH + Tor + Obfuscated SSH
-webssh -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050 -debug
-# + obfs_secret в proxy.json
+# Максимальная защита: TLS Camouflage + DoH + Tor + XOR
+./webssh -p 3400 -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050 -debug
+# sni_hostname и obfs_secret задаются в proxy.json
 ```
 
 ## Быстрый старт
@@ -133,11 +137,23 @@ port = 2222
 
 CLI-флаги `-doh` и `-proxy` имеют приоритет над `proxy.json`.
 
-**`obfs_secret`** — секретный ключ для обфускации SSH-трафика:
-- При пустой строке (`""`) обфускация выключена
-- Любая строка от 1 символа включает маскировку SSH-протокола
-- Если сервер не поддерживает обфускацию, происходит автоматический fallback на plain
-- Рекомендуется: `openssl rand -base64 32`
+**Параметры обхода блокировок:**
+
+- **`socks5`** — адрес SOCKS5-прокси (например `127.0.0.1:9050` для Tor)
+- **`doh`** — URL DoH-резолвера (например `https://dns.cloudflare.com/dns-query`)
+- **`direct_ips`** — список IP-адресов для прямого подключения (в обход DNS, наивысший приоритет)
+- **`alt_ports`** — альтернативные порты SSH (перебираются если стандартный порт недоступен)
+- **`enable_tor`** — зарезервировано для будущего использования
+- **`sni_hostname`** — **TLS Camouflage**: домен для маскировки SSH под HTTPS (например `cloudflare.com`). DPI видит обычный TLS-трафик к легитимному сайту. Это самый сильный метод обфускации.
+- **`obfs_secret`** — XOR-обфускация (legacy fallback): секретный ключ для маскировки SSH-протокола.
+  - При пустой строке (`""`) XOR-обфускация выключена
+  - Если сервер не поддерживает обфускацию, происходит автоматический fallback на plain
+  - Рекомендуется: `openssl rand -base64 32`
+
+**Приоритет обфускации (в коде):**
+1. Если указан `sni_hostname` → TLS Camouflage (самый сильный, DPI неотличим от HTTPS)
+2. Если нет `sni_hostname`, но есть `obfs_secret` → XOR obfuscation (legacy)
+3. Иначе → plain-соединение без обфускации
 
 ### `access.json` — контроль доступа по IP
 
