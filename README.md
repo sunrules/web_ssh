@@ -10,7 +10,7 @@
 - **IP-контроль доступа** — белый список IP/подсетей через `access.json`.
 - **TLS 1.2/1.3** — автоматическое включение при наличии сертификатов.
 - **Graceful shutdown** — корректное завершение сессий при перезапуске.
-- **Настройки по умолчанию** — host/port из `webssh.conf` подставляются в форму браузера.
+- **Настройки по умолчанию** — host/port и uTLS fingerprint из `webssh.conf` подставляются в форму браузера.
 - **Буфер обмена** — Ctrl+C / Ctrl+V / правая кнопка мыши (копирование/вставка).
 - **Поддержка ресайза** — терминал автоматически подстраивается под размер окна.
 
@@ -20,15 +20,15 @@
 
 | Механизм | Описание | Настройка |
 |---|---|---|
-| **TLS Camouflage** | Маскировка SSH под HTTPS-трафик к легитимному сайту (cloudflare.com, google.com). DPI видит обычный TLS 1.3 с браузерным fingerprint'ом. | `proxy.json` → `sni_hostname` |
-| **DNS-over-HTTPS (DoH)** | Шифрованные DNS-запросы с поддержкой IPv6 (AAAA) и fallback на POST wire формат | `-doh URL` |
+| **uTLS Camouflage** | Маскировка SSH под HTTPS-трафик с эмуляцией Chrome/Firefox/Safari. DPI видит браузерный TLS handshake (JA3 fingerprint), а не Go-клиент. | `proxy.json` → `sni_hostname`, `webssh.conf` → `[utls]` |
+| **DNS-over-HTTPS (DoH)** | Шифрованные DNS-запросы с поддержкой IPv4 (A) и IPv6 (AAAA) через раздельные запросы. | `-doh URL` |
 | **Приоритет IPv6** | IPv6-адреса подключаются первыми — DPI РКН хуже фильтрует IPv6 трафик | Встроено |
-| **SOCKS5-прокси** | Маршрутизация SSH через Tor, Shadowsocks | `-proxy addr` |
-| **XOR Obfuscation (legacy)** | Маскировка SSH-трафика: XOR + fake HTTP-баннер (fallback, если TLS недоступен) | `proxy.json` → `obfs_secret` |
+| **SOCKS5-прокси** | Маршрутизация SSH через Tor, Shadowsocks (автонастройка через `enable_tor`) | `-proxy addr` / `proxy.json` → `enable_tor` |
+| **XOR Obfuscation (legacy)** | Маскировка SSH-трафика: XOR + fake HTTP-баннер (fallback, если uTLS недоступен) | `proxy.json` → `obfs_secret` |
 | **Прямые IP-адреса** | Подключение напрямую по IP с наивысшим приоритетом, минуя DNS-блокировки | `proxy.json` → `direct_ips` |
 | **Альтернативные порты** | Подключение по нестандартным портам (2222, 2053, 8443 и др.) | `proxy.json` → `alt_ports` |
-| **Автоматический перебор** | Последовательный перебор всех комбинаций (direct → IPv6 → IPv4 → host → altPorts) | Встроено |
-| **Fallback** | Автоматический откат на plain-соединение при EOF | Встроено |
+| **Автоматический перебор стратегий** | Каждая комбинация (адрес + метод обфускации) — отдельная стратегия. Перебор: direct→DoH IPv6→DoH IPv4→host→altPorts, для каждой: TLS→XOR→plain | Встроено |
+| **Fallback** | Автоматический откат: uTLS → XOR → plain (для каждого адреса) | Встроено |
 | **Таймауты** | TCP dial (12с), SSH handshake (20с) | Встроено |
 
 ### Примеры обхода блокировок
@@ -40,9 +40,9 @@ webssh -doh https://dns.cloudflare.com/dns-query
 # DoH + Tor (SOCKS5)
 webssh -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050
 
-# Максимальная защита: TLS Camouflage + DoH + Tor + XOR
+# Максимальная защита: uTLS Camouflage + DoH + Tor + XOR
 ./webssh -p 3400 -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050 -debug
-# sni_hostname и obfs_secret задаются в proxy.json
+# sni_hostname и obfs_secret задаются в proxy.json, utls fingerprint в webssh.conf
 ```
 
 ## Быстрый старт
@@ -110,16 +110,31 @@ systemctl enable --now webssh
 
 ## Конфигурация
 
-### `webssh.conf` — настройки по умолчанию для формы в браузере (опционально)
+### `webssh.conf` — настройки по умолчанию и uTLS fingerprint (опционально)
 
-INI-файл в директории с бинарником. Значения host/port подставляются в форму при загрузке страницы через endpoint `/config`.
+INI-файл в директории с бинарником. Поддерживает секции `[main]` (host/port для формы) и `[utls]` (выбор браузерного fingerprint для DPI-обхода).
 
 ```ini
 # WebSSH configuration
 [main]
 host = 127.0.0.1
 port = 2222
+
+# uTLS Client Hello fingerprint (браузерная эмуляция для обхода DPI)
+[utls]
+client_hello = HelloChrome_Auto
 ```
+
+**Секция `[utls]`** — настройка эмуляции браузерного TLS handshake (JA3 fingerprint):
+- `HelloChrome_Auto` — Chrome (автовыбор актуальной версии, рекомендуется)
+- `HelloFirefox_Auto` — Firefox
+- `HelloEdge_Auto` — Microsoft Edge
+- `HelloSafari_Auto` — Safari
+- `HelloIOS_Auto` — iOS Safari
+- `HelloRandomized` — случайный fingerprint (экспериментально)
+- `HelloGolang` — стандартный Go fingerprint (без обфускации)
+
+Если секция `[utls]` отсутствует — по умолчанию используется `HelloChrome_Auto`.
 
 ### `proxy.json` — настройки обхода блокировок (опционально)
 
@@ -185,6 +200,7 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 
 ## Использованные технологии Go 1.26
 
+- **`github.com/refraction-networking/utls`** — эмуляция браузерного TLS handshake (JA3 fingerprint Chrome/Firefox/Safari) для обхода DPI.
 - **`log/slog`** — структурированное логирование с уровнями Info, Warn, Debug.
 - **`errors.Is` / `fmt.Errorf(%w)`** — корректная обработка и wrapping ошибок.
 - **`map[string]any`** — типизированные слайсы вместо `interface{}`.

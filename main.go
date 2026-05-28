@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/net/proxy"
@@ -145,12 +146,26 @@ func loadWebSSHConfig(path string) {
 		debugLog.Debug("webssh.conf not found, using defaults", "path", path, "error", err)
 		return
 	}
+
+	// Карта известных ClientHello ID для uTLS
+	helloIDs := map[string]utls.ClientHelloID{
+		"HelloChrome_Auto":  utls.HelloChrome_Auto,
+		"HelloFirefox_Auto": utls.HelloFirefox_Auto,
+		"HelloEdge_Auto":    utls.HelloEdge_Auto,
+		"HelloSafari_Auto":  utls.HelloSafari_Auto,
+		"HelloIOS_Auto":     utls.HelloIOS_Auto,
+		"HelloRandomized":   utls.HelloRandomized,
+		"HelloGolang":       utls.HelloGolang,
+	}
+
+	currentSection := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			currentSection = strings.ToLower(line[1 : len(line)-1])
 			continue
 		}
 		parts := strings.SplitN(line, "=", 2)
@@ -159,12 +174,25 @@ func loadWebSSHConfig(path string) {
 		}
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
-		switch key {
-		case "host":
-			websshConf.Host = val
-		case "port":
-			if p, e := strconv.Atoi(val); e == nil && p > 0 {
-				websshConf.Port = p
+
+		switch currentSection {
+		case "main":
+			switch key {
+			case "host":
+				websshConf.Host = val
+			case "port":
+				if p, e := strconv.Atoi(val); e == nil && p > 0 {
+					websshConf.Port = p
+				}
+			}
+		case "utls":
+			if key == "client_hello" {
+				if id, ok := helloIDs[val]; ok {
+					utlsClientHelloID = id
+					debugLog.Debug("uTLS client hello ID set", "id", val)
+				} else {
+					logger.Warn("unknown uTLS client hello ID, using default", "id", val, "default", utlsClientHelloID.Str())
+				}
 			}
 		}
 	}
@@ -227,7 +255,7 @@ func (r *dohResolver) lookupHost(ctx context.Context, host string) ([]string, er
 		qtype string
 		rtype int
 	}{
-		{"A", 1},    // IPv4
+		{"A", 1},     // IPv4
 		{"AAAA", 28}, // IPv6
 	} {
 		u := fmt.Sprintf("%s?name=%s&type=%s", r.baseURL, url.QueryEscape(host), dnsType.qtype)
@@ -296,74 +324,53 @@ func socksDialer(addr string) proxy.Dialer {
 //  обфускации теперь в SSHConnector.applyObfuscation)
 
 // ---------------------------------------------------------------------------
-// TLS camouflage (TLS-in-TCP tunnel for DPI bypass)
+// uTLS camouflage — эмуляция браузерного TLS (Chrome 124+) для обхода DPI
 // ---------------------------------------------------------------------------
 
-// tlsCamouflageConn wraps a TLS connection over plain TCP.
-// To DPI it looks like a normal HTTPS session to the specified SNI host.
-type tlsCamouflageConn struct {
-	*tls.Conn
+// utlsClientHelloID хранит выбранный fingerprint для uTLS.
+// Загружается из webssh.conf (секция [utls] → key "client_hello").
+// По умолчанию HelloChrome_133 (актуально на 2026).
+var utlsClientHelloID = utls.HelloChrome_133
+
+// uTLSCamouflageConn wraps a uTLS connection over plain TCP.
+// To DPI it looks like a real Chrome TLS handshake to the specified SNI host.
+type uTLSCamouflageConn struct {
+	*utls.UConn
+	sniHostname string
 }
 
-func newTLSCamouflageConn(conn net.Conn, sniHostname string) (*tlsCamouflageConn, error) {
-	// Используем cipher suites и настройки, имитирующие реальный браузерный TLS
-	// Список cipher suites взят из типичного набора Chrome/Firefox
-	tlsConfig := &tls.Config{
+func newUTLSCamouflageConn(conn net.Conn, sniHostname string) (*uTLSCamouflageConn, error) {
+	tlsConn := utls.UClient(conn, &utls.Config{
 		ServerName:         sniHostname,
-		InsecureSkipVerify: true, // Мы не проверяем сертификат — это маскировка, не безопасность
-		MinVersion:         tls.VersionTLS12,
-		MaxVersion:         tls.VersionTLS13,
-		// Browser-like cipher suites
-		CipherSuites: []uint16{
-			tls.TLS_AES_128_GCM_SHA256,
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-		},
-		// Отключаем HTTP/2 и ALPN для более простого fingerprint'а
-		NextProtos: []string{"http/1.1"},
-		// Включаем поддержку session tickets как в браузере
-		SessionTicketsDisabled: false,
-		// Не используем PreferServerCipherSuites — браузеры так не делают
-		PreferServerCipherSuites: false,
-		// Эмуляция браузерного набора поддерживаемых групп (CurvePreferences)
-		CurvePreferences: []tls.CurveID{
-			tls.X25519,
-			tls.CurveP256,
-			tls.CurveP384,
-		},
-	}
+		InsecureSkipVerify: true,
+	}, utlsClientHelloID)
 
-	tlsConn := tls.Client(conn, tlsConfig)
-
-	// Выполняем TLS handshake — это и есть camouflage
-	// DPI видит обычное TLS-соединение к легитимному хосту
 	if err := tlsConn.Handshake(); err != nil {
-		return nil, fmt.Errorf("TLS camouflage handshake failed: %w", err)
+		return nil, fmt.Errorf("uTLS camouflage handshake failed: %w", err)
 	}
 
-	debugLog.Debug("TLS camouflage established",
+	state := tlsConn.ConnectionState()
+	helloIDStr := utlsClientHelloID.Str()
+
+	debugLog.Debug("uTLS camouflage established",
 		"sni", sniHostname,
-		"cipher", tlsConn.ConnectionState().CipherSuite,
-		"version", tlsConn.ConnectionState().Version,
-		"server_name", tlsConn.ConnectionState().ServerName,
+		"client_hello_id", helloIDStr,
+		"cipher", state.CipherSuite,
+		"version", state.Version,
 	)
 
-	return &tlsCamouflageConn{tlsConn}, nil
+	return &uTLSCamouflageConn{
+		UConn:       tlsConn,
+		sniHostname: sniHostname,
+	}, nil
 }
 
-// Close закрывает TLS соединение и отправляет TLS close_notify
-func (tc *tlsCamouflageConn) Close() error {
-	// Пытаемся gracefully закрыть TLS (отправляем close_notify)
-	if err := tc.Conn.CloseWrite(); err != nil {
-		// Игнорируем ошибки — некоторые сервера не поддерживают
+// Close закрывает uTLS соединение
+func (tc *uTLSCamouflageConn) Close() error {
+	if err := tc.UConn.CloseWrite(); err != nil {
+		// Игнорируем ошибки
 	}
-	return tc.Conn.Close()
+	return tc.UConn.Close()
 }
 
 // ---------------------------------------------------------------------------
@@ -738,13 +745,14 @@ func (sc *SSHConnector) applyObfuscation(conn net.Conn, method string) (net.Conn
 	switch method {
 	case "tls":
 		if proxyConf.SNIHostname != "" {
-			tlsConn, err := newTLSCamouflageConn(conn, proxyConf.SNIHostname)
+			tlsConn, err := newUTLSCamouflageConn(conn, proxyConf.SNIHostname)
 			if err != nil {
-				return conn, fmt.Errorf("TLS camouflage failed: %w", err)
+				return conn, fmt.Errorf("uTLS camouflage failed: %w", err)
 			}
 			return tlsConn, nil
 		}
-		return conn, fmt.Errorf("TLS camouflage not configured (sni_hostname is empty)")
+		// Если sni_hostname не задан — возвращаем conn без ошибки (пропускаем TLS стратегию)
+		return conn, nil
 	case "xor":
 		if proxyConf.ObfsSecret != "" {
 			xorConn, err := newObfuscatedConn(conn, proxyConf.ObfsSecret)
@@ -753,7 +761,7 @@ func (sc *SSHConnector) applyObfuscation(conn net.Conn, method string) (net.Conn
 			}
 			return xorConn, nil
 		}
-		return conn, fmt.Errorf("XOR obfuscation not configured (obfs_secret is empty)")
+		return conn, nil
 	default:
 		return conn, nil
 	}
