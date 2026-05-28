@@ -2,13 +2,15 @@ let term = null;
 let ws = null;
 let fitAddon = null;
 let resizeSent = false;
+let wsPath = '/ws'; // default, will be overridden by /config
 
-// Load default connection settings from server webssh.conf
+// Load default connection settings and WebSocket path from server
 fetch('/config')
     .then(r => r.json())
     .then(cfg => {
         if (cfg.host) document.getElementById('host').value = cfg.host;
         if (cfg.port) document.getElementById('port').value = cfg.port;
+        if (cfg.ws_path) wsPath = cfg.ws_path;
     })
     .catch(() => {
         // keep defaults if config endpoint unavailable
@@ -46,7 +48,7 @@ function sendResize() {
 
 function connectSSH(host, port, username, password) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    const wsUrl = `${protocol}//${window.location.host}${wsPath}`;
 
     ws = new WebSocket(wsUrl);
     resizeSent = false;
