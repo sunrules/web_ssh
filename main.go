@@ -24,7 +24,6 @@
 //   - Encrypted Client Hello (ECH) support
 //   - Randomized WebSocket endpoint path
 //   - ClientHello padding for DPI evasion
-//   - Honeypot mode for active probe protection
 
 package main
 
@@ -148,7 +147,7 @@ var (
 	utlsClientHelloID = utls.HelloChrome_133 // настраиваемый по умолчанию
 
 	utlsFingerprintPool = []utls.ClientHelloID{
-		utls.HelloChrome_Auto,
+		utls.HelloChrome_133,
 		utls.HelloFirefox_Auto,
 		utls.HelloIOS_Auto,
 		utls.HelloRandomizedALPN,
@@ -497,18 +496,34 @@ func newUTLSCamouflageConn(conn net.Conn, sniHostname string, fp utls.ClientHell
 
 	tlsConn := utls.UClient(conn, tlsConfig, fp)
 
-	// Применяем дополнительные расширения для усиления маскировки
-	if err := tlsConn.ApplyPreset(&utls.ClientHelloSpec{
-		TLSVersMax:         utls.VersionTLS13,
-		TLSVersMin:         utls.VersionTLS12,
-		CompressionMethods: []uint8{0},
-		Extensions: append(
-			getExtensionList(),
-			&utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
-		),
-	}); err != nil {
-		// Если ApplyPreset не удался — продолжаем с дефолтным парротом
-		debugLog.Debug("uTLS ApplyPreset failed, using parrot defaults", "fingerprint", fp.Str(), "error", err)
+	// Для стандартных fingerprint'ов (Chrome, Firefox, iOS) оставляем оригинальный spec без изменений.
+	// ApplyPreset с кастомными расширениями применяем только для HelloCustom/HelloRandomized,
+	// чтобы не перетирать точную эмуляцию браузера, предоставляемую uTLS.
+	if fp == utls.HelloCustom || fp == utls.HelloRandomizedALPN || fp == utls.HelloRandomized {
+		if err := tlsConn.ApplyPreset(&utls.ClientHelloSpec{
+			TLSVersMax:         utls.VersionTLS13,
+			TLSVersMin:         utls.VersionTLS12,
+			CompressionMethods: []uint8{0},
+			Extensions: append(
+				getExtensionList(),
+				&utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
+			),
+		}); err != nil {
+			debugLog.Debug("uTLS ApplyPreset failed, using parrot defaults", "fingerprint", fp.Str(), "error", err)
+		}
+	} else {
+		// Для стандартных fingerprint'ов всё равно добавляем padding extension
+		// через отдельный ApplyPreset только с padding, чтобы не трогать остальные расширения
+		if err := tlsConn.ApplyPreset(&utls.ClientHelloSpec{
+			TLSVersMax:         utls.VersionTLS13,
+			TLSVersMin:         utls.VersionTLS12,
+			CompressionMethods: []uint8{0},
+			Extensions: []utls.TLSExtension{
+				&utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
+			},
+		}); err != nil {
+			debugLog.Debug("uTLS padding extension failed, using defaults", "fingerprint", fp.Str(), "error", err)
+		}
 	}
 
 	if err := tlsConn.Handshake(); err != nil {
@@ -914,11 +929,11 @@ func (sc *SSHConnector) buildStrategies() []ConnectionStrategy {
 		addr := fullAddr(sc.Host, altPort)
 		if proxyConf.SNIHostname != "" {
 			// На альтернативных портах — только рабочий fingerprint + default
-			优选FPS := []utls.ClientHelloID{utlsClientHelloID}
+			preferredFPS := []utls.ClientHelloID{utlsClientHelloID}
 			if hasWorkingFingerprint && workingFingerprint != utlsClientHelloID {
-				优选FPS = append([]utls.ClientHelloID{workingFingerprint}, 优选FPS...)
+				preferredFPS = append([]utls.ClientHelloID{workingFingerprint}, preferredFPS...)
 			}
-			for _, fp := range 优选FPS {
+			for _, fp := range preferredFPS {
 				strategies = append(strategies, ConnectionStrategy{
 					Address:     addr,
 					Obfuscation: "tls",
@@ -978,14 +993,24 @@ func (sc *SSHConnector) dial(addr string) (net.Conn, error) {
 			err  error
 		}
 		ch := make(chan dialResult, 1)
+		ctx, cancel := context.WithTimeout(sc.Ctx, 12*time.Second)
+		defer cancel()
+
 		go func() {
 			c, e := sc.SocksDialer.Dial("tcp", addr)
-			ch <- dialResult{c, e}
+			select {
+			case ch <- dialResult{c, e}:
+			case <-ctx.Done():
+				// Если родитель уже ушёл — закрываем соединение, чтобы не было утечки
+				if c != nil {
+					c.Close()
+				}
+			}
 		}()
 		select {
 		case res := <-ch:
 			return res.conn, res.err
-		case <-time.After(12 * time.Second):
+		case <-ctx.Done():
 			return nil, fmt.Errorf("SOCKS5 dial timeout after 12s")
 		case <-sc.Ctx.Done():
 			return nil, sc.Ctx.Err()
@@ -1194,7 +1219,6 @@ RKN bypass (configured via proxy.json):
   - Encrypted Client Hello (ECH) support
   - Randomized WebSocket endpoint path
   - ClientHello padding for DPI evasion
-  - Honeypot mode for active probe protection
 
 Examples:
   webssh

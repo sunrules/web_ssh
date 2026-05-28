@@ -20,7 +20,7 @@
 
 | Механизм | Описание | Настройка |
 |---|---|---|
-| **Ротация TLS-фингерпринтов** | Автоматический перебор fingerprint'ов: Chrome → Firefox → iOS → Randomized. Если DPI заблокировал конкретный fingerprint, следующая попытка использует другой. Успешный fingerprint кешируется для повторного использования. | Встроено (пул из 4 fingerprint'ов) |
+| **Ротация TLS-фингерпринтов** | Автоматический перебор fingerprint'ов: Chrome 133 → Firefox → iOS → Randomized. Если DPI заблокировал конкретный fingerprint, следующая попытка использует другой. Успешный fingerprint кешируется для повторного использования. Для стандартных fingerprint'ов (Chrome/Firefox/iOS) не перетирается точная эмуляция браузера — добавляется только padding. | Встроено (пул из 4 fingerprint'ов) |
 | **Encrypted Client Hello (ECH)** | Шифрует реальный SNI внутри TLS-хендшейка. DPI видит только внешний SNI (напр. `cloudflare.com`), а реальный домен зашифрован. | `proxy.json` → `ech_config` (base64 из DNS) |
 | **uTLS Camouflage** | Маскировка SSH под HTTPS-трафик с эмуляцией Chrome/Firefox/Safari. DPI видит браузерный TLS handshake (JA3 fingerprint), а не Go-клиент. Включает ClientHello padding (BoringPaddingStyle) для маскировки размера. | `proxy.json` → `sni_hostname`, `webssh.conf` → `[utls]` |
 | **DoH мульти-провайдер** | Цепочка DNS-over-HTTPS провайдеров: Cloudflare → Google → Quad9 → Mozilla. Если один заблокирован — автоматический переход на следующий. | `proxy.json` → `doh_providers` |
@@ -128,11 +128,11 @@ port = 2222
 
 # uTLS Client Hello fingerprint (браузерная эмуляция для обхода DPI)
 [utls]
-client_hello = HelloChrome_Auto
+client_hello = HelloChrome_133
 ```
 
 **Секция `[utls]`** — настройка эмуляции браузерного TLS handshake (JA3 fingerprint):
-- `HelloChrome_Auto` — Chrome (автовыбор актуальной версии, рекомендуется)
+- `HelloChrome_133` — Chrome 133 (стабильная версия, рекомендуется)
 - `HelloFirefox_Auto` — Firefox
 - `HelloEdge_Auto` — Microsoft Edge
 - `HelloSafari_Auto` — Safari
@@ -141,7 +141,7 @@ client_hello = HelloChrome_Auto
 - `HelloGolang` — стандартный Go fingerprint (без обфускации)
 
 Если секция `[utls]` отсутствует — по умолчанию используется `HelloChrome_133`.
-**Важно:** настроенный fingerprint используется как приоритетный кандидат, но система автоматически перебирает другие fingerprint'и из пула (Chrome, Firefox, iOS, Randomized) если основной заблокирован.
+**Важно:** настроенный fingerprint используется как приоритетный кандидат, но система автоматически перебирает другие fingerprint'и из пула (Chrome 133, Firefox, iOS, Randomized) если основной заблокирован. Для стандартных браузерных fingerprint'ов uTLS оставляет оригинальный ClientHelloSpec без изменений (добавляется только ClientHello padding), чтобы сохранить точную эмуляцию браузера.
 
 ### `proxy.json` — настройки обхода блокировок (опционально)
 
