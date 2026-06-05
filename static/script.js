@@ -3,6 +3,10 @@ let ws = null;
 let fitAddon = null;
 let resizeSent = false;
 let wsPath = '/ws'; // default, will be overridden by /config
+let reconnectAttempt = 0;
+let maxReconnectAttempts = 5;
+let lastHost = '', lastPort = 0, lastUsername = '', lastPassword = '';
+let connectionStatus = 'disconnected'; // 'connecting', 'connected', 'disconnected'
 
 // Load default connection settings and WebSocket path from server
 fetch('/config')
@@ -23,6 +27,13 @@ document.getElementById('ssh-form').addEventListener('submit', (e) => {
     const port = parseInt(document.getElementById('port').value);
     const username = document.getElementById('username').value;
     const password = document.getElementById('password').value;
+
+    lastHost = host;
+    lastPort = port;
+    lastUsername = username;
+    lastPassword = password;
+    reconnectAttempt = 0;
+    connectionStatus = 'connecting';
 
     connectSSH(host, port, username, password);
 });
@@ -65,8 +76,6 @@ function connectSSH(host, port, username, password) {
         const container = document.getElementById('terminal-container');
         container.style.display = 'flex';
 
-        document.getElementById('connection-info').textContent = `${username}@${host}:${port}`;
-
         requestAnimationFrame(() => {
             requestAnimationFrame(() => {
                 initTerminal();
@@ -93,12 +102,31 @@ function connectSSH(host, port, username, password) {
 
     ws.onerror = (error) => {
         console.error('WebSocket error:', error);
-        alert('Connection error');
+        if (reconnectAttempt === 0) {
+            alert('Connection error');
+        }
     };
 
     ws.onclose = () => {
         if (term) {
             term.write('\r\n\x1b[31mConnection closed\x1b[0m\r\n');
+        }
+
+        // Auto-reconnect with exponential backoff
+        if (reconnectAttempt < maxReconnectAttempts && lastHost) {
+            reconnectAttempt++;
+            const delay = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
+            console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempt}/${maxReconnectAttempts})`);
+            if (term) {
+                term.write(`\r\n\x1b[33mReconnecting in ${delay/1000}s (attempt ${reconnectAttempt}/${maxReconnectAttempts})...\x1b[0m\r\n`);
+            }
+            setTimeout(() => {
+                connectSSH(lastHost, lastPort, lastUsername, lastPassword);
+            }, delay);
+        } else if (reconnectAttempt >= maxReconnectAttempts && lastHost) {
+            if (term) {
+                term.write('\r\n\x1b[31mMax reconnection attempts reached. Please reconnect manually.\x1b[0m\r\n');
+            }
         }
     };
 }
@@ -136,8 +164,7 @@ function initTerminal() {
             brightWhite: '#ffffff'
         },
         convertEol: true,
-        disableStdin: false,
-        allowProposedApi: true
+        disableStdin: false
     });
 
     fitAddon = new FitAddon.FitAddon();
@@ -196,11 +223,6 @@ function initTerminal() {
         }
     });
 
-    // Double-click to select word
-    terminalElement.addEventListener('dblclick', () => {
-        // xterm handles word selection natively
-    });
-
     // Resize handling — debounced
     let resizeTimer = null;
     window.addEventListener('resize', () => {
@@ -223,13 +245,14 @@ function initTerminal() {
 }
 
 function disconnect() {
-    if (ws) {
-        ws.close();
-    }
+    reconnectAttempt = maxReconnectAttempts; // prevent auto-reconnect
     if (term) {
         term.dispose();
         term = null;
         fitAddon = null;
+    }
+    if (ws) {
+        ws.close();
     }
     document.getElementById('login-form').style.display = 'block';
     document.getElementById('terminal-container').style.display = 'none';

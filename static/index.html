@@ -11,7 +11,7 @@
     <div class="container">
         <div id="login-form" class="login-form">
             <h2>WebSSH Terminal</h2>
-            <p class="version-info">Go 1.26 · DoH · SOCKS5 · Obfs · WSS</p>
+            <p class="version-info" style="font-size:0.75em;">UDP-tunnel → DoH → uTLS/PQ → ChaCha20 → H2 → Tor</p>
             <form id="ssh-form">
                 <input type="text" id="host" placeholder="Host (e.g., localhost)" value="localhost" required>
                 <input type="number" id="port" placeholder="Port" value="2222" required>
@@ -35,6 +35,6 @@
     
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
-    <script src="/script.js?v=2"></script>
+    <script src="/script.js?v=4"></script>
 </body>
 </html>

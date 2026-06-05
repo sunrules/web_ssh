@@ -111,6 +111,31 @@ body {
     background: #cc0000;
 }
 
+/* Connection status indicator */
+#connection-info {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.status-connecting {
+    color: #ffaa00;
+    animation: pulse 1s ease-in-out infinite;
+}
+
+.status-connected {
+    color: #4caf50;
+}
+
+.status-disconnected {
+    color: #ff4444;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
 #terminal {
     flex: 1 1 auto;
     position: relative;
