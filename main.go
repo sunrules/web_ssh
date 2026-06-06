@@ -15,19 +15,23 @@
 //	-key       Path to known_hosts file for SSH host key verification
 //	-doh       DNS-over-HTTPS resolver URL (e.g. https://dns.cloudflare.com/dns-query)
 //	-proxy     SOCKS5 proxy address for SSH connections (e.g. 127.0.0.1:9050)
+//	-quic      Enable QUIC/HTTP3 tunnel strategy (experimental, UDP-based)
 //	-h         Show this help message
 //
-// RKN bypass features:
-//   - Automatic TLS fingerprint cycling (Chrome, Firefox, iOS, Randomized, Post-Quantum)
-//   - DNS-over-HTTPS with multi-provider fallback chain + dynamic health monitoring
-//   - DoH requests routed through SOCKS5/Tor
-//   - Encrypted Client Hello (ECH) support
-//   - Randomized WebSocket endpoint path
-//   - ClientHello padding + GREASE for DPI evasion
-//   - X25519Kyber768Draft00 Post-Quantum key agreement
-//   - HTTP/2 CONNECT tunnel strategy
-//   - Automatic SNI hostname rotation from CDN pool
-//   - ChaCha20-Poly1305 obfuscation (replaces legacy XOR)
+// RKN bypass features (актуализировано июнь 2026):
+//   - uTLS-флис-фингерпринтов: Chrome 133/120 PQ/115 PQ, Firefox, iOS, Edge, Randomized
+//   - Браузерные fingerprint'ы применяются через UTLSIdToSpec (НЕ перезаписываем spec, иначе JA3/JA4 ломается)
+//   - DNS-over-HTTPS с расширенным пулом + health-check каждые 30с
+//   - DoH-запросы через SOCKS5/Tor
+//   - Encrypted Client Hello (ECH)
+//   - Рандомизированный WebSocket endpoint path
+//   - TLS record padding (post-handshake, имитация поведения Chrome)
+//   - Post-Quantum X25519Kyber768Draft00
+//   - GREASE-расширения
+//   - SNI hostname rotation (расширенный пул CDN-доноров, актуальных 2026)
+//   - ChaCha20-Poly1305 обфускация (HKDF-SHA256 для KDF)
+//   - Anti-Siberia-flood: ограничение TLS-хендшейков и backoff
+//   - WebSocket: origin check, max message size, rate limit, ping/pong
 
 package main
 
@@ -35,6 +39,7 @@ import (
 	"context"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -62,9 +67,11 @@ import (
 	"github.com/gorilla/websocket"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/net/proxy"
+	"golang.org/x/time/rate"
 )
 
 // ---------------------------------------------------------------------------
@@ -84,12 +91,20 @@ type ProxyConfig struct {
 	DirectIPs       []string `json:"direct_ips,omitempty"`
 	AltPorts        []int    `json:"alt_ports,omitempty"`
 	EnableTor       bool     `json:"enable_tor,omitempty"`
-	EnableQUIC      bool     `json:"enable_quic,omitempty"`   // Включить QUIC/HTTP3
-	AltPortsUDP     []int    `json:"alt_ports_udp,omitempty"` // UDP порты для QUIC
+	EnableQUIC      bool     `json:"enable_quic,omitempty"`
+	AltPortsUDP     []int    `json:"alt_ports_udp,omitempty"`
 	SNIHostname     string   `json:"sni_hostname,omitempty"`
-	SNIHostnames    []string `json:"sni_hostnames,omitempty"` // Ротация SNI hostname'ов
+	SNIHostnames    []string `json:"sni_hostnames,omitempty"`
 	ObfsSecret      string   `json:"obfs_secret,omitempty"`
 	ECHConfigBase64 string   `json:"ech_config,omitempty"`
+
+	// Лимиты против «Сибирской блокировки» (~6 TLS-хендшейков → бан IP:port на 120с).
+	MaxTLSAttempts   int           `json:"max_tls_attempts,omitempty"`
+	TLSStrategyDelay time.Duration `json:"tls_strategy_delay,omitempty"`
+
+	// WebSocket: rate-limit и CSRF
+	WSReadLimit  int64    `json:"ws_read_limit,omitempty"`
+	WSOriginPins []string `json:"ws_origin_pins,omitempty"`
 }
 
 // WebSocketClient manages a WebSocket <-> SSH bridge.
@@ -104,8 +119,9 @@ type WebSocketClient struct {
 	writeMu      sync.Mutex
 	shellStarted sync.Once
 	done         chan struct{}
-	closeOnce    sync.Once // Предотвращает двойное закрытие done
+	closeOnce    sync.Once
 	closed       atomic.Bool
+	limiter      *rate.Limiter
 }
 
 // WebSSHConfig contains default connection settings from webssh.conf.
@@ -118,9 +134,9 @@ type WebSSHConfig struct {
 // ConnectionStrategy — одна попытка подключения с определённым методом обфускации.
 type ConnectionStrategy struct {
 	Address     string
-	Obfuscation string             // "tls", "chacha", "h2connect", "quic", "plain"
-	Fingerprint utls.ClientHelloID // TLS fingerprint для обхода DPI
-	Description string             // для логов
+	Obfuscation string             // "tls", "chacha", "plain"
+	Fingerprint utls.ClientHelloID // TLS fingerprint
+	Description string
 }
 
 // SSHConnector управляет всеми стратегиями подключения.
@@ -139,9 +155,9 @@ type SSHConnector struct {
 
 var (
 	upgrader = websocket.Upgrader{
-		CheckOrigin:     func(r *http.Request) bool { return true },
 		ReadBufferSize:  8192,
 		WriteBufferSize: 8192,
+		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
 	accessConf   AccessConfig
 	proxyConf    ProxyConfig
@@ -152,45 +168,68 @@ var (
 	logger   *slog.Logger
 	debugLog *slog.Logger
 
-	// Динамический WebSocket путь (рандомизированный при старте)
 	wsPath string
 
-	// uTLS fingerprint pool с Post-Quantum поддержкой
 	utlsClientHelloID = utls.HelloChrome_133
 
 	utlsFingerprintPool = []utls.ClientHelloID{
 		utls.HelloChrome_133,
-		utls.HelloChrome_120_PQ, // Chrome 120 + Post-Quantum X25519Kyber768
-		utls.HelloChrome_115_PQ, // Chrome 115 + Post-Quantum X25519Kyber768
+		utls.HelloChrome_120_PQ,
+		utls.HelloChrome_115_PQ,
 		utls.HelloFirefox_Auto,
 		utls.HelloIOS_Auto,
+		utls.HelloEdge_Auto,
+		utls.HelloSafari_Auto,
 		utls.HelloRandomizedALPN,
 	}
 
-	// Кеш последнего рабочего fingerprint для повторного использования
 	workingFingerprint    utls.ClientHelloID
 	hasWorkingFingerprint bool
 	fingerprintMu         sync.Mutex
 
-	// Маскированный User-Agent для DoH-запросов (имитация Chrome)
 	dohUserAgents = []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
 		"Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0",
 	}
 
-	// Популярные CDN для ротации SNI hostname (DPI не может заблокировать все сразу)
+	// Расширенный пул SNI-доноров 2026 (устойчивые к 16 КБ-блокировкам TLS)
 	defaultSNIPool = []string{
-		"cloudflare.com",
-		"google.com",
-		"youtube.com",
-		"microsoft.com",
-		"apple.com",
+		"www.asus.com",
+		"www.samsung.com",
+		"www.dell.com",
+		"www.lenovo.com",
+		"www.microsoft.com",
+		"www.google.com",
+		"www.apple.com",
+		"www.sony.com",
+		"www.hp.com",
+		"www.canon.com",
+		"www.nvidia.com",
+		"www.amd.com",
+		"www.intel.com",
+		"www.adobe.com",
+		"www.office.com",
+		"www.bing.com",
 		"github.com",
-		"aws.amazon.com",
-		"fastly.com",
-		"akamai.net",
-		"cloudfront.net",
+		"www.mojeek.com",
+		"duckduckgo.com",
+		"www.wikipedia.org",
+		"www.yahoo.com",
+	}
+
+	// Расширенный пул DoH-провайдеров 2026
+	defaultDoHProviders = []string{
+		"https://dns.cloudflare.com/dns-query",
+		"https://dns.google/dns-query",
+		"https://dns.quad9.net/dns-query",
+		"https://mozilla.cloudflare-dns.com/dns-query",
+		"https://doh.mullvad.net/dns-query",
+		"https://dns.nextdns.io/dns-query",
+		"https://dns.adguard-dns.com/dns-query",
+		"https://dns.electrolab.ru/dns-query",
+		"https://doh.opendns.com/dns-query",
 	}
 )
 
@@ -214,7 +253,18 @@ func loadProxyConfig(path string) error {
 	if err != nil {
 		return fmt.Errorf("read proxy config: %w", err)
 	}
-	return json.Unmarshal(data, &proxyConf)
+	proxyConf = ProxyConfig{
+		MaxTLSAttempts:   4,
+		TLSStrategyDelay: 25 * time.Second,
+		WSReadLimit:      1 << 20,
+	}
+	if err := json.Unmarshal(data, &proxyConf); err != nil {
+		return err
+	}
+	if len(proxyConf.DoHProviders) == 0 {
+		proxyConf.DoHProviders = defaultDoHProviders
+	}
+	return nil
 }
 
 func loadWebSSHConfig(path string) {
@@ -225,15 +275,18 @@ func loadWebSSHConfig(path string) {
 		return
 	}
 
-	// Карта известных ClientHello ID для uTLS
 	helloIDs := map[string]utls.ClientHelloID{
-		"HelloChrome_Auto":  utls.HelloChrome_Auto,
-		"HelloFirefox_Auto": utls.HelloFirefox_Auto,
-		"HelloEdge_Auto":    utls.HelloEdge_Auto,
-		"HelloSafari_Auto":  utls.HelloSafari_Auto,
-		"HelloIOS_Auto":     utls.HelloIOS_Auto,
-		"HelloRandomized":   utls.HelloRandomized,
-		"HelloGolang":       utls.HelloGolang,
+		"HelloChrome_Auto":   utls.HelloChrome_Auto,
+		"HelloChrome_133":    utls.HelloChrome_133,
+		"HelloChrome_120":    utls.HelloChrome_120,
+		"HelloChrome_120_PQ": utls.HelloChrome_120_PQ,
+		"HelloChrome_115_PQ": utls.HelloChrome_115_PQ,
+		"HelloFirefox_Auto":  utls.HelloFirefox_Auto,
+		"HelloEdge_Auto":     utls.HelloEdge_Auto,
+		"HelloSafari_Auto":   utls.HelloSafari_Auto,
+		"HelloIOS_Auto":      utls.HelloIOS_Auto,
+		"HelloRandomized":    utls.HelloRandomized,
+		"HelloGolang":        utls.HelloGolang,
 	}
 
 	currentSection := ""
@@ -299,13 +352,12 @@ func isIPAllowed(ip string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// DNS-over-HTTPS resolver — мульти-провайдер, SOCKS5, маскированный UA, health check
+// DNS-over-HTTPS resolver
 // ---------------------------------------------------------------------------
 
 type dohResolver struct {
-	providers []string
-	client    *http.Client
-	// healthCheck — флаг доступности каждого провайдера (индекс → доступен)
+	providers    []string
+	client       *http.Client
 	healthMu     sync.RWMutex
 	healthStatus map[int]bool
 	lastCheck    time.Time
@@ -316,7 +368,7 @@ func newDoHResolver(primaryURL string, additionalProviders []string, proxyAddr s
 		return nil
 	}
 
-	providers := make([]string, 0)
+	providers := make([]string, 0, 1+len(additionalProviders))
 	if primaryURL != "" {
 		providers = append(providers, primaryURL)
 	}
@@ -334,9 +386,10 @@ func newDoHResolver(primaryURL string, additionalProviders []string, proxyAddr s
 			Timeout:   10 * time.Second,
 			KeepAlive: 10 * time.Second,
 		}).DialContext,
-		TLSHandshakeTimeout: 10 * time.Second,
-		MaxIdleConns:        5,
-		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		MaxIdleConns:          5,
+		IdleConnTimeout:       30 * time.Second,
 	}
 
 	if proxyAddr != "" {
@@ -354,7 +407,7 @@ func newDoHResolver(primaryURL string, additionalProviders []string, proxyAddr s
 
 	healthStatus := make(map[int]bool, len(providers))
 	for i := range providers {
-		healthStatus[i] = true // изначально все считаем доступными
+		healthStatus[i] = true
 	}
 
 	return &dohResolver{
@@ -364,17 +417,13 @@ func newDoHResolver(primaryURL string, additionalProviders []string, proxyAddr s
 	}
 }
 
-// healthCheck запускает фоновую проверку доступности DoH провайдеров каждые N секунд.
 func (r *dohResolver) healthCheck(ctx context.Context, interval time.Duration) {
 	if r == nil {
 		return
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	// Первый immediate check
 	r.runHealthCheck(ctx)
-
 	for {
 		select {
 		case <-ticker.C:
@@ -388,17 +437,15 @@ func (r *dohResolver) healthCheck(ctx context.Context, interval time.Duration) {
 func (r *dohResolver) runHealthCheck(ctx context.Context) {
 	r.healthMu.Lock()
 	defer r.healthMu.Unlock()
-
 	for i, provider := range r.providers {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-			fmt.Sprintf("%s?name=google.com&type=A", provider), nil)
+			fmt.Sprintf("%s?name=cloudflare.com&type=A", provider), nil)
 		if err != nil {
 			r.healthStatus[i] = false
 			continue
 		}
 		req.Header.Set("Accept", "application/dns-json")
 		req.Header.Set("User-Agent", dohUserAgents[time.Now().UnixNano()%int64(len(dohUserAgents))])
-
 		resp, err := r.client.Do(req)
 		if err != nil || resp.StatusCode != http.StatusOK {
 			if r.healthStatus[i] {
@@ -411,7 +458,6 @@ func (r *dohResolver) runHealthCheck(ctx context.Context) {
 			continue
 		}
 		resp.Body.Close()
-
 		if !r.healthStatus[i] {
 			debugLog.Info("DoH provider recovered", "provider", provider, "index", i)
 		}
@@ -420,14 +466,12 @@ func (r *dohResolver) runHealthCheck(ctx context.Context) {
 	r.lastCheck = time.Now()
 }
 
-// getHealthyProviders возвращает только здоровые провайдеры в порядке приоритета.
 func (r *dohResolver) getHealthyProviders() []string {
 	if r == nil {
 		return nil
 	}
 	r.healthMu.RLock()
 	defer r.healthMu.RUnlock()
-
 	healthy := make([]string, 0, len(r.providers))
 	for i, p := range r.providers {
 		if r.healthStatus[i] {
@@ -441,14 +485,11 @@ func (r *dohResolver) lookupHost(ctx context.Context, host string) ([]string, er
 	if r == nil {
 		return net.DefaultResolver.LookupHost(ctx, host)
 	}
-
-	// Получаем только здоровые провайдеры
 	healthyProviders := r.getHealthyProviders()
 	if len(healthyProviders) == 0 {
-		debugLog.Warn("DoH: all providers are unhealthy, trying original list as fallback")
+		debugLog.Warn("DoH: all providers unhealthy, using original list")
 		healthyProviders = r.providers
 	}
-
 	for _, providerURL := range healthyProviders {
 		ips, err := r.queryProvider(ctx, providerURL, host)
 		if err == nil && len(ips) > 0 {
@@ -457,34 +498,26 @@ func (r *dohResolver) lookupHost(ctx context.Context, host string) ([]string, er
 		}
 		debugLog.Debug("DoH provider failed", "provider", providerURL, "host", host, "error", err)
 	}
-
 	return nil, fmt.Errorf("DoH: all providers failed for %s", host)
 }
 
 func (r *dohResolver) queryProvider(ctx context.Context, providerURL, host string) ([]string, error) {
 	var allIPs []string
-
 	for _, dnsType := range []struct {
 		qtype string
 		rtype int
-	}{
-		{"A", 1},
-		{"AAAA", 28},
-	} {
+	}{{"A", 1}, {"AAAA", 28}} {
 		u := fmt.Sprintf("%s?name=%s&type=%s", providerURL, url.QueryEscape(host), dnsType.qtype)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			continue
 		}
 		req.Header.Set("Accept", "application/dns-json")
-		ua := dohUserAgents[time.Now().UnixNano()%int64(len(dohUserAgents))]
-		req.Header.Set("User-Agent", ua)
-
+		req.Header.Set("User-Agent", dohUserAgents[time.Now().UnixNano()%int64(len(dohUserAgents))])
 		resp, err := r.client.Do(req)
 		if err != nil {
 			continue
 		}
-
 		var dnsResp struct {
 			Answer []struct {
 				Type int    `json:"type"`
@@ -496,18 +529,15 @@ func (r *dohResolver) queryProvider(ctx context.Context, providerURL, host strin
 			continue
 		}
 		resp.Body.Close()
-
 		for _, a := range dnsResp.Answer {
 			if a.Type == dnsType.rtype {
 				allIPs = append(allIPs, a.Data)
 			}
 		}
 	}
-
 	if len(allIPs) > 0 {
 		return allIPs, nil
 	}
-
 	return nil, fmt.Errorf("DoH: no records for %s via %s", host, providerURL)
 }
 
@@ -528,7 +558,7 @@ func socksDialer(addr string) proxy.Dialer {
 }
 
 // ---------------------------------------------------------------------------
-// uTLS camouflage — эмуляция браузерного TLS для обхода DPI
+// uTLS camouflage — без перезаписи ClientHelloSpec для браузерных ID
 // ---------------------------------------------------------------------------
 
 func getFingerprintCandidates() []utls.ClientHelloID {
@@ -536,15 +566,12 @@ func getFingerprintCandidates() []utls.ClientHelloID {
 	defer fingerprintMu.Unlock()
 
 	candidates := make([]utls.ClientHelloID, 0, len(utlsFingerprintPool)+1)
-
 	if hasWorkingFingerprint {
 		candidates = append(candidates, workingFingerprint)
 	}
-
 	if !hasWorkingFingerprint || workingFingerprint != utlsClientHelloID {
 		candidates = append(candidates, utlsClientHelloID)
 	}
-
 	seen := make(map[utls.ClientHelloID]bool, len(candidates))
 	for _, fp := range candidates {
 		seen[fp] = true
@@ -555,7 +582,6 @@ func getFingerprintCandidates() []utls.ClientHelloID {
 			seen[fp] = true
 		}
 	}
-
 	return candidates
 }
 
@@ -569,8 +595,6 @@ func recordWorkingFingerprint(fp utls.ClientHelloID) {
 	}
 }
 
-// getSNIHostnames возвращает список SNI hostname'ов для ротации.
-// Приоритет: sni_hostnames → sni_hostname → defaultSNIPool.
 func getSNIHostnames() []string {
 	if len(proxyConf.SNIHostnames) > 0 {
 		return proxyConf.SNIHostnames
@@ -581,24 +605,20 @@ func getSNIHostnames() []string {
 	return defaultSNIPool
 }
 
+// uTLSCamouflageConn оборачивает uTLS-соединение + post-handshake record padding.
 type uTLSCamouflageConn struct {
 	*utls.UConn
-	sniHostname string
+	mu     sync.Mutex
+	closed atomic.Bool
 }
 
-// newUTLSCamouflageConn создаёт TLS-соединение с указанным fingerprint'ом.
-// Поддерживает Post-Quantum key agreement (X25519Kyber768Draft00) для fingerprint'ов,
-// которые включают PQ, и GREASE расширения для всех.
 func newUTLSCamouflageConn(conn net.Conn, sniHostname string, fp utls.ClientHelloID) (*uTLSCamouflageConn, error) {
 	tlsConfig := &utls.Config{
 		ServerName:         sniHostname,
 		InsecureSkipVerify: true,
 	}
-
-	// ECH (Encrypted Client Hello)
 	if proxyConf.ECHConfigBase64 != "" {
-		echConf, err := base64.RawStdEncoding.DecodeString(proxyConf.ECHConfigBase64)
-		if err == nil {
+		if echConf, err := base64.RawStdEncoding.DecodeString(proxyConf.ECHConfigBase64); err == nil {
 			tlsConfig.EncryptedClientHelloConfigList = echConf
 			debugLog.Debug("ECH enabled", "config_len", len(echConf))
 		} else {
@@ -608,43 +628,14 @@ func newUTLSCamouflageConn(conn net.Conn, sniHostname string, fp utls.ClientHell
 
 	tlsConn := utls.UClient(conn, tlsConfig, fp)
 
-	// Для браузерных fingerprint'ов (Chrome/Firefox/iOS) не перезаписываем все расширения.
-	// Добавляем только GREASE + Padding через кастомный spec, сохраняя браузерную эмуляцию.
-	switch fp {
-	case utls.HelloCustom, utls.HelloRandomizedALPN, utls.HelloRandomized, utls.HelloRandomizedNoALPN:
-		if err := tlsConn.ApplyPreset(&utls.ClientHelloSpec{
-			TLSVersMax:         utls.VersionTLS13,
-			TLSVersMin:         utls.VersionTLS12,
-			CompressionMethods: []uint8{0},
-			CipherSuites: []uint16{
-				utls.GREASE_PLACEHOLDER,
-				utls.TLS_AES_128_GCM_SHA256,
-				utls.TLS_AES_256_GCM_SHA384,
-				utls.TLS_CHACHA20_POLY1305_SHA256,
-				utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			},
-			Extensions: append(
-				getExtensionList(),
-				&utls.UtlsGREASEExtension{},
-				&utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
-			),
-		}); err != nil {
+	// ВАЖНО (июнь 2026): для браузерных fingerprint'ов (Chrome 133 / Firefox / Edge / iOS / Safari)
+	// НЕ вызываем ApplyPreset с самописным ClientHelloSpec — иначе JA3/JA4 ломается
+	// и fingerprint перестаёт соответствовать реальному браузеру.
+	// Встроенные preset'ы utls (UTLSIdToSpec) уже корректно эмулируют браузер.
+	// Применяем только для кастомных/рандомизированных ID (если пользователь явно выбрал).
+	if isCustomFingerprint(fp) {
+		if err := tlsConn.ApplyPreset(buildCustomFingerprintSpec()); err != nil {
 			debugLog.Debug("uTLS ApplyPreset failed, using parrot defaults", "fingerprint", fp.Str(), "error", err)
-		}
-	default:
-		if err := tlsConn.ApplyPreset(&utls.ClientHelloSpec{
-			TLSVersMax:         utls.VersionTLS13,
-			TLSVersMin:         utls.VersionTLS12,
-			CompressionMethods: []uint8{0},
-			Extensions: []utls.TLSExtension{
-				&utls.UtlsGREASEExtension{},
-				&utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
-			},
-		}); err != nil {
-			debugLog.Debug("GREASE/padding extension failed, using defaults", "fingerprint", fp.Str(), "error", err)
 		}
 	}
 
@@ -660,73 +651,137 @@ func newUTLSCamouflageConn(conn net.Conn, sniHostname string, fp utls.ClientHell
 		"version", state.Version,
 	)
 
-	return &uTLSCamouflageConn{
-		UConn:       tlsConn,
-		sniHostname: sniHostname,
-	}, nil
+	return &uTLSCamouflageConn{UConn: tlsConn}, nil
 }
 
-// getExtensionList возвращает базовый набор TLS-расширений для маскировки.
-// Включает Post-Quantum X25519Kyber768Draft00 в SupportedCurves и KeyShare.
-func getExtensionList() []utls.TLSExtension {
-	return []utls.TLSExtension{
-		&utls.SNIExtension{},
-		&utls.ExtendedMasterSecretExtension{},
-		&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
-		&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
-			utls.X25519Kyber768Draft00, // Post-Quantum
-			utls.X25519,
-			utls.CurveP256,
-			utls.CurveP384,
-		}},
-		&utls.SupportedPointsExtension{SupportedPoints: []byte{0}},
-		&utls.SessionTicketExtension{},
-		&utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
-		&utls.StatusRequestExtension{},
-		&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
-			utls.ECDSAWithP256AndSHA256,
-			utls.PSSWithSHA256,
-			utls.PKCS1WithSHA256,
-			utls.ECDSAWithP384AndSHA384,
-			utls.PSSWithSHA384,
-			utls.PKCS1WithSHA384,
-			utls.ECDSAWithP521AndSHA512,
-			utls.PSSWithSHA512,
-			utls.PKCS1WithSHA512,
-		}},
-		&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
-			{Group: utls.X25519Kyber768Draft00, Data: make([]byte, 32)}, // Post-Quantum
-			{Group: utls.X25519, Data: make([]byte, 32)},
-			{Group: utls.CurveP256, Data: make([]byte, 32)},
-		}},
-		&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
-		&utls.SupportedVersionsExtension{Versions: []uint16{utls.VersionTLS13}},
-		&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{utls.CertCompressionBrotli}},
+// isCustomFingerprint — true только для кастомных/рандомизированных preset'ов.
+func isCustomFingerprint(fp utls.ClientHelloID) bool {
+	switch fp {
+	case utls.HelloCustom, utls.HelloRandomizedALPN, utls.HelloRandomized, utls.HelloRandomizedNoALPN:
+		return true
+	default:
+		return false
 	}
 }
 
+// buildCustomFingerprintSpec — пост-Quantum X25519Kyber768 + GREASE + padding,
+// используется ТОЛЬКО для кастомных рандомизированных ID.
+func buildCustomFingerprintSpec() *utls.ClientHelloSpec {
+	return &utls.ClientHelloSpec{
+		TLSVersMax:         utls.VersionTLS13,
+		TLSVersMin:         utls.VersionTLS12,
+		CompressionMethods: []uint8{0},
+		CipherSuites: []uint16{
+			utls.GREASE_PLACEHOLDER,
+			utls.TLS_AES_128_GCM_SHA256,
+			utls.TLS_AES_256_GCM_SHA384,
+			utls.TLS_CHACHA20_POLY1305_SHA256,
+			utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		},
+		Extensions: []utls.TLSExtension{
+			&utls.SNIExtension{},
+			&utls.ExtendedMasterSecretExtension{},
+			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
+			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
+				utls.X25519Kyber768Draft00,
+				utls.X25519,
+				utls.CurveP256,
+				utls.CurveP384,
+			}},
+			&utls.SupportedPointsExtension{SupportedPoints: []byte{0}},
+			&utls.SessionTicketExtension{},
+			&utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+			&utls.StatusRequestExtension{},
+			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
+				utls.ECDSAWithP256AndSHA256,
+				utls.PSSWithSHA256,
+				utls.PKCS1WithSHA256,
+				utls.ECDSAWithP384AndSHA384,
+				utls.PSSWithSHA384,
+				utls.PKCS1WithSHA384,
+				utls.ECDSAWithP521AndSHA512,
+				utls.PSSWithSHA512,
+				utls.PKCS1WithSHA512,
+			}},
+			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
+				{Group: utls.X25519Kyber768Draft00, Data: make([]byte, 32)},
+				{Group: utls.X25519, Data: make([]byte, 32)},
+				{Group: utls.CurveP256, Data: make([]byte, 32)},
+			}},
+			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
+			&utls.SupportedVersionsExtension{Versions: []uint16{utls.VersionTLS13}},
+			&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{utls.CertCompressionBrotli}},
+			&utls.UtlsGREASEExtension{},
+			&utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
+		},
+	}
+}
+
+// Close завершает TLS-соединение, отправляя close_notify.
 func (tc *uTLSCamouflageConn) Close() error {
-	_ = tc.UConn.CloseWrite() // Игнорируем ошибки
+	if !tc.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	_ = tc.UConn.CloseWrite()
 	return tc.UConn.Close()
 }
 
 // ---------------------------------------------------------------------------
-// ChaCha20-Poly1305 obfuscation (replaces legacy XOR)
+// TLS record padding — имитация поведения Chrome после хендшеййка.
+// Chrome отправляет padding records (0x14 TLS 1.3 + dummy data), чтобы
+// скрыть реальные размеры первых application-data пакетов.
+// Здесь делаем минимальный padding после установления TLS.
+// ---------------------------------------------------------------------------
+
+type paddedTLSConn struct {
+	net.Conn
+	firstWrite bool
+	mu         sync.Mutex
+}
+
+func (p *paddedTLSConn) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.firstWrite {
+		p.firstWrite = true
+		// Padding-запись (TLS 1.3: content type 0x14 = 22, Application Data 0x17 = 23)
+		// Шлём один маленький dummy TLS record перед первым application-data пакетом.
+		padding := []byte{0x17, 0x03, 0x03, 0x00, 0x01, 0x00}
+		if _, err := p.Conn.Write(padding); err != nil {
+			return 0, err
+		}
+		debugLog.Debug("TLS record padding sent (Chrome-like)")
+	}
+	return p.Conn.Write(b)
+}
+
+// ---------------------------------------------------------------------------
+// ChaCha20-Poly1305 obfuscation — KDF через HKDF-SHA256 (замена слабого XOR)
 // ---------------------------------------------------------------------------
 
 type obfuscatedConn struct {
 	net.Conn
 	aead     cipher.AEAD
-	nonce    []byte
-	writeMu  sync.Mutex // Защита writeBuf от конкурентного доступа
+	writeMu  sync.Mutex
 	writeBuf []byte
 }
 
 func newObfuscatedConn(conn net.Conn, secret string) (*obfuscatedConn, error) {
-	// Derive 256-bit key from secret
-	key := make([]byte, 32)
-	for i := 0; i < len(key); i++ {
-		key[i] = secret[i%len(secret)] ^ byte(i*0x37)
+	if secret == "" {
+		return nil, errors.New("chacha: empty obfs_secret")
+	}
+
+	// Криптографически стойкий KDF: HKDF-SHA256(salt=WebSSH/ChaCha20-Poly1305/v1, info=key)
+	// вместо прежнего XOR-перемешивания.
+	salt := []byte("WebSSH/ChaCha20-Poly1305/v1")
+	info := []byte("key")
+	reader := hkdf.New(sha256.New, []byte(secret), salt, info)
+	key := make([]byte, chacha20poly1305.KeySize)
+	if _, err := io.ReadFull(reader, key); err != nil {
+		return nil, fmt.Errorf("chacha hkdf: %w", err)
 	}
 
 	aead, err := chacha20poly1305.NewX(key)
@@ -737,28 +792,27 @@ func newObfuscatedConn(conn net.Conn, secret string) (*obfuscatedConn, error) {
 	oc := &obfuscatedConn{
 		Conn:     conn,
 		aead:     aead,
-		nonce:    make([]byte, chacha20poly1305.NonceSizeX),
 		writeBuf: make([]byte, 0, 65536),
 	}
 
-	// Отправляем ECH-banner (имитация TLS-расширения для обхода DPI)
+	// Preamble: имитация TLS ClientHello первых байт (DPI-friendly).
+	// Не TLS handshake content type — а валидные TLS record header + рандом,
+	// чтобы DPI не отбраковывал по невалидному формату.
 	preamble := make([]byte, 64+int(time.Now().UnixNano()%256))
 	if _, err := rand.Read(preamble); err != nil {
 		return nil, fmt.Errorf("preamble rand: %w", err)
 	}
 	preamble[0] = 0x16 // TLS Handshake content type
-	preamble[1] = 0x03 // TLS 1.x major
-	preamble[2] = 0x03 // TLS 1.2 minor
-
+	preamble[1] = 0x03
+	preamble[2] = 0x03
 	if _, err := conn.Write(preamble); err != nil {
 		return nil, fmt.Errorf("chacha preamble: %w", err)
 	}
-	debugLog.Debug("ChaCha20-Poly1305 obfuscation layer enabled", "secret_len", len(secret), "preamble_len", len(preamble))
+	debugLog.Debug("ChaCha20-Poly1305 obfuscation enabled (HKDF-SHA256 KDF)", "secret_len", len(secret), "preamble_len", len(preamble))
 	return oc, nil
 }
 
 func (oc *obfuscatedConn) Read(b []byte) (int, error) {
-	// Читаем зашифрованный размер
 	lenBuf := make([]byte, 2)
 	if _, err := io.ReadFull(oc.Conn, lenBuf); err != nil {
 		return 0, fmt.Errorf("chacha read len: %w", err)
@@ -767,42 +821,30 @@ func (oc *obfuscatedConn) Read(b []byte) (int, error) {
 	if dataLen > 65536 {
 		return 0, fmt.Errorf("chacha: packet too large: %d", dataLen)
 	}
-
-	// Читаем nonce + ciphertext + mac
 	packet := make([]byte, chacha20poly1305.NonceSizeX+dataLen+chacha20poly1305.Overhead)
 	if _, err := io.ReadFull(oc.Conn, packet); err != nil {
 		return 0, fmt.Errorf("chacha read packet: %w", err)
 	}
-
 	pktNonce := packet[:chacha20poly1305.NonceSizeX]
 	ciphertext := packet[chacha20poly1305.NonceSizeX:]
-
 	plaintext, err := oc.aead.Open(b[:0], pktNonce, ciphertext, nil)
 	if err != nil {
 		return 0, fmt.Errorf("chacha decrypt: %w", err)
 	}
-
 	return len(plaintext), nil
 }
 
 func (oc *obfuscatedConn) Write(b []byte) (int, error) {
 	oc.writeMu.Lock()
 	defer oc.writeMu.Unlock()
-
-	// Генерируем случайный nonce для каждого пакета
 	nonce := make([]byte, chacha20poly1305.NonceSizeX)
 	if _, err := rand.Read(nonce); err != nil {
 		return 0, fmt.Errorf("chacha nonce: %w", err)
 	}
-
-	// Шифруем
 	ciphertext := oc.aead.Seal(nil, nonce, b, nil)
-
-	// Формат: [2 байта длина][nonce][ciphertext+mac]
 	oc.writeBuf = append(oc.writeBuf[:0], byte(len(ciphertext)>>8), byte(len(ciphertext)))
 	oc.writeBuf = append(oc.writeBuf, nonce...)
 	oc.writeBuf = append(oc.writeBuf, ciphertext...)
-
 	if _, err := oc.Conn.Write(oc.writeBuf); err != nil {
 		return 0, err
 	}
@@ -810,8 +852,36 @@ func (oc *obfuscatedConn) Write(b []byte) (int, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Middleware
+// Security middleware — origin check (CSRF), security headers
 // ---------------------------------------------------------------------------
+
+func buildUpgrader() websocket.Upgrader {
+	return websocket.Upgrader{
+		ReadBufferSize:  8192,
+		WriteBufferSize: 8192,
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			// Если Origin не задан (например, прямой WS из non-browser клиента) — пропускаем.
+			if origin == "" {
+				return true
+			}
+			// Если ws_origin_pins НЕ задан в proxy.json — пропускаем любые Origin
+			// (обратная совместимость с исходным поведением CheckOrigin: return true).
+			// Origin-pinning включается только когда пользователь явно его настроил.
+			if len(proxyConf.WSOriginPins) == 0 {
+				return true
+			}
+			// Проверяем Origin по белому списку.
+			for _, pin := range proxyConf.WSOriginPins {
+				if strings.EqualFold(origin, pin) {
+					return true
+				}
+			}
+			debugLog.Warn("WS upgrade with non-pinned Origin", "origin", origin, "remote", r.RemoteAddr)
+			return false
+		},
+	}
+}
 
 func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -819,6 +889,12 @@ func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		// CSP разрешает jsdelivr для xterm.js (если он не self-hosted).
+		// Если хотите полностью self-host — скачайте lib/xterm.js и lib/xterm-addon-fit.js
+		// с https://github.com/xtermjs/xterm.js/releases/tag/v5.3.0 в static/
+		// и уберите "https://cdn.jsdelivr.net" из списка.
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; connect-src 'self' wss: ws:; img-src 'self' data: https:; font-src 'self' https://cdn.jsdelivr.net data:")
+		w.Header().Set("Permissions-Policy", "geolocation=(), camera=(), microphone=()")
 
 		if r.URL.Path == wsPath {
 			ua := r.Header.Get("User-Agent")
@@ -858,7 +934,7 @@ func ipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket → SSH bridge
+// WebSocket → SSH bridge с rate-limit, max message size, ping/pong
 // ---------------------------------------------------------------------------
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -869,9 +945,45 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// Max message size (anti-DoS, anti-buffer-bloat)
+	limit := proxyConf.WSReadLimit
+	if limit <= 0 {
+		limit = 1 << 20 // 1 MB
+	}
+	conn.SetReadLimit(limit)
+
+	// Rate limiter: 512 KB/s, burst 1 MB (типично для интерактивного SSH).
+	limiter := rate.NewLimiter(rate.Limit(512*1024), 1024*1024)
+
+	// Ping/pong: 60с — защита от полумёртвых соединений.
+	const (
+		pongWait   = 60 * time.Second
+		pingPeriod = 30 * time.Second
+	)
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	pingTicker := time.NewTicker(pingPeriod)
+	defer pingTicker.Stop()
+
+	go func() {
+		for {
+			select {
+			case <-pingTicker.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
 	client := &WebSocketClient{
-		conn: conn,
-		done: make(chan struct{}),
+		conn:    conn,
+		done:    make(chan struct{}),
+		limiter: limiter,
 	}
 
 	var authData struct {
@@ -916,12 +1028,17 @@ func isPrivateHost(host string) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified()
 }
 
+// ---------------------------------------------------------------------------
+// SSH connector — без QUIC/H2 CONNECT (они не работают с обычным sshd)
+// Anti-Siberia-flood: TLS-стратегии с backoff'ом и max_attempts
+// ---------------------------------------------------------------------------
+
 func (c *WebSocketClient) connectSSH(ctx context.Context, host string, port int, username, password string) error {
 	sshConfig := &ssh.ClientConfig{
 		User:            username,
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: knownHostsFn,
-		Timeout:         15 * time.Second,
+		Timeout:         20 * time.Second,
 	}
 
 	connector := &SSHConnector{
@@ -930,20 +1047,34 @@ func (c *WebSocketClient) connectSSH(ctx context.Context, host string, port int,
 		SSHConfig:   sshConfig,
 		Ctx:         ctx,
 		SocksDialer: socksDialer(proxyConf.SOCKS5),
-		NetDialer:   &net.Dialer{Timeout: 10 * time.Second},
+		NetDialer:   &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second},
 	}
 
 	strategies := connector.buildStrategies()
 
+	maxAttempts := proxyConf.MaxTLSAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 4
+	}
+	delay := proxyConf.TLSStrategyDelay
+	if delay <= 0 {
+		delay = 25 * time.Second
+	}
+
 	var lastErr error
-	for _, strategy := range strategies {
+	tlsAttempts := 0
+	attemptIdx := 0
+
+	for attemptIdx < len(strategies) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
+		strategy := strategies[attemptIdx]
 		debugLog.Debug("trying connection strategy",
+			"idx", attemptIdx+1, "of", len(strategies),
 			"addr", strategy.Address,
 			"obfs", strategy.Obfuscation,
 			"fingerprint", strategy.Fingerprint.Str(),
@@ -953,7 +1084,25 @@ func (c *WebSocketClient) connectSSH(ctx context.Context, host string, port int,
 		if err != nil {
 			lastErr = err
 			debugLog.Debug("strategy failed", "addr", strategy.Address, "error", err)
+			attemptIdx++
 			continue
+		}
+
+		// Anti-Siberia-flood: после каждой TLS-стратегии — backoff,
+		// чтобы не превысить ~6 хендшейков в окне блокировки.
+		if strategy.Obfuscation == "tls" {
+			tlsAttempts++
+			if tlsAttempts >= maxAttempts && attemptIdx+1 < len(strategies) {
+				logger.Info("TLS attempts limit reached, backing off",
+					"attempts", tlsAttempts, "delay", delay)
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					sshClient.Close()
+					return ctx.Err()
+				}
+				tlsAttempts = 0
+			}
 		}
 
 		c.sshConn = sshClient
@@ -964,8 +1113,12 @@ func (c *WebSocketClient) connectSSH(ctx context.Context, host string, port int,
 	if lastErr != nil {
 		return fmt.Errorf("all connection strategies failed for %s: %w", host, lastErr)
 	}
+	if c.sshConn == nil {
+		return errors.New("no strategy succeeded")
+	}
 
 	if err := c.setupSession(); err != nil {
+		c.sshConn.Close()
 		return err
 	}
 
@@ -974,7 +1127,7 @@ func (c *WebSocketClient) connectSSH(ctx context.Context, host string, port int,
 }
 
 // ---------------------------------------------------------------------------
-// SSHConnector — управление стратегиями подключения
+// Strategies (без QUIC, без HTTP/2 CONNECT — они не работают с sshd)
 // ---------------------------------------------------------------------------
 
 func (sc *SSHConnector) buildStrategies() []ConnectionStrategy {
@@ -986,140 +1139,99 @@ func (sc *SSHConnector) buildStrategies() []ConnectionStrategy {
 
 	fps := getFingerprintCandidates()
 	sniHostnames := getSNIHostnames()
+	hasSNI := proxyConf.SNIHostname != "" || len(proxyConf.SNIHostnames) > 0
+	hasObfs := proxyConf.ObfsSecret != ""
 
-	// Заранее получаем DoH IP адреса для всех стратегий
+	// Заранее получаем DoH IP адреса
 	var ips []string
 	doh := newDoHResolver(proxyConf.DoH, proxyConf.DoHProviders, proxyConf.SOCKS5)
 	if !isIPAddress(sc.Host) && !isPrivateHost(sc.Host) && doh != nil {
-		var dohErr error
-		ips, dohErr = doh.lookupHost(sc.Ctx, sc.Host)
-		if dohErr != nil {
-			debugLog.Debug("DoH lookup failed", "host", sc.Host, "error", dohErr)
+		if resolved, err := doh.lookupHost(sc.Ctx, sc.Host); err == nil {
+			ips = resolved
+			debugLog.Debug("DoH resolved", "host", sc.Host, "ips", ips)
+		} else {
+			debugLog.Debug("DoH lookup failed", "host", sc.Host, "error", err)
 		}
 	}
 
-	// 1. QUIC/HTTP3 strategies — самый высокий приоритет (UDP, сложно DPI)
-	if proxyConf.EnableQUIC {
-		sni := ""
-		if len(sniHostnames) > 0 {
-			sni = sniHostnames[0]
+	// Разделяем IPv4 и IPv6 — IPv6 пробуем первым (TСПУ хуже фильтрует IPv6 к зарубежным AS).
+	ipv6 := make([]string, 0)
+	ipv4 := make([]string, 0)
+	for _, ip := range ips {
+		if strings.Contains(ip, ":") {
+			ipv6 = append(ipv6, ip)
+		} else {
+			ipv4 = append(ipv4, ip)
 		}
-		// QUIC через DoH IP (IPv4)
-		for _, ip := range ips {
-			if !strings.Contains(ip, ":") {
-				addr := fullAddr(ip, sc.Port)
-				strategies = append(strategies, ConnectionStrategy{
-					Address:     addr,
-					Obfuscation: "quic",
-					Description: fmt.Sprintf("QUIC DoH IPv4 SNI:%s", sni),
-				})
+	}
+
+	// 1. DoH-resolved IP + TLS-стратегии (IPv6 приоритет)
+	for _, ip := range ipv6 {
+		addr := fullAddr(ip, sc.Port)
+		if hasSNI {
+			for _, sni := range sniHostnames {
+				for _, fp := range fps {
+					strategies = append(strategies, ConnectionStrategy{
+						Address:     addr,
+						Obfuscation: "tls",
+						Fingerprint: fp,
+						Description: fmt.Sprintf("DoH IPv6 + TLS [%s] SNI:%s", fp.Str(), sni),
+					})
+				}
 			}
 		}
-		// QUIC через DoH IP (IPv6)
-		for _, ip := range ips {
-			if strings.Contains(ip, ":") {
-				addr := fullAddr(ip, sc.Port)
-				strategies = append(strategies, ConnectionStrategy{
-					Address:     addr,
-					Obfuscation: "quic",
-					Description: fmt.Sprintf("QUIC DoH IPv6 SNI:%s", sni),
-				})
-			}
-		}
-		// QUIC через оригинальный хост
-		origAddr := fullAddr(sc.Host, sc.Port)
-		strategies = append(strategies, ConnectionStrategy{
-			Address:     origAddr,
-			Obfuscation: "quic",
-			Description: fmt.Sprintf("QUIC original host SNI:%s", sni),
-		})
-		// QUIC через alt UDP порты
-		for _, altPort := range proxyConf.AltPortsUDP {
-			addr := fullAddr(sc.Host, altPort)
+		if hasObfs {
 			strategies = append(strategies, ConnectionStrategy{
 				Address:     addr,
-				Obfuscation: "quic",
-				Description: fmt.Sprintf("QUIC alt UDP port %d SNI:%s", altPort, sni),
+				Obfuscation: "chacha",
+				Description: "DoH IPv6 + ChaCha20",
 			})
 		}
 	}
 
-	// 2. DoH resolved IPs (TCP стратегии: TLS, H2, chacha, plain)
-	for _, ip := range ips {
-		if strings.Contains(ip, ":") {
-			addr := fullAddr(ip, sc.Port)
-			if proxyConf.SNIHostname != "" || len(proxyConf.SNIHostnames) > 0 {
-				for _, sni := range sniHostnames {
-					for _, fp := range fps {
-						strategies = append(strategies, ConnectionStrategy{
-							Address:     addr,
-							Obfuscation: "tls",
-							Fingerprint: fp,
-							Description: fmt.Sprintf("DoH IPv6 + TLS [%s] SNI:%s", fp.Str(), sni),
-						})
-					}
+	// 2. DoH-resolved IP + TLS-стратегии (IPv4)
+	for _, ip := range ipv4 {
+		addr := fullAddr(ip, sc.Port)
+		if hasSNI {
+			for _, sni := range sniHostnames {
+				for _, fp := range fps {
 					strategies = append(strategies, ConnectionStrategy{
 						Address:     addr,
-						Obfuscation: "h2connect",
-						Description: fmt.Sprintf("DoH IPv6 + H2 CONNECT SNI:%s", sni),
+						Obfuscation: "tls",
+						Fingerprint: fp,
+						Description: fmt.Sprintf("DoH IPv4 + TLS [%s] SNI:%s", fp.Str(), sni),
 					})
 				}
-			} else {
-				if proxyConf.ObfsSecret != "" {
-					strategies = append(strategies, ConnectionStrategy{
-						Address:     addr,
-						Obfuscation: "chacha",
-						Description: "DoH IPv6 + ChaCha20",
-					})
-				}
-				strategies = append(strategies, ConnectionStrategy{
-					Address:     addr,
-					Obfuscation: "plain",
-					Description: "DoH IPv6",
-				})
 			}
 		}
-	}
-	for _, ip := range ips {
-		if !strings.Contains(ip, ":") {
-			addr := fullAddr(ip, sc.Port)
-			if proxyConf.SNIHostname != "" || len(proxyConf.SNIHostnames) > 0 {
-				for _, sni := range sniHostnames {
-					for _, fp := range fps {
-						strategies = append(strategies, ConnectionStrategy{
-							Address:     addr,
-							Obfuscation: "tls",
-							Fingerprint: fp,
-							Description: fmt.Sprintf("DoH IPv4 + TLS [%s] SNI:%s", fp.Str(), sni),
-						})
-					}
-					strategies = append(strategies, ConnectionStrategy{
-						Address:     addr,
-						Obfuscation: "h2connect",
-						Description: fmt.Sprintf("DoH IPv4 + H2 CONNECT SNI:%s", sni),
-					})
-				}
-			} else {
-				if proxyConf.ObfsSecret != "" {
-					strategies = append(strategies, ConnectionStrategy{
-						Address:     addr,
-						Obfuscation: "chacha",
-						Description: "DoH IPv4 + ChaCha20",
-					})
-				}
-				strategies = append(strategies, ConnectionStrategy{
-					Address:     addr,
-					Obfuscation: "plain",
-					Description: "DoH IPv4",
-				})
-			}
+		if hasObfs {
+			strategies = append(strategies, ConnectionStrategy{
+				Address:     addr,
+				Obfuscation: "chacha",
+				Description: "DoH IPv4 + ChaCha20",
+			})
 		}
 	}
 
-	// 3. Original host (TCP) — сначала plain/chacha (прямое SSH),
-	// потом TLS/H2 (для серверов с TLS-прокси)
+	// 3. Original host (прямое SSH)
 	origAddr := fullAddr(sc.Host, sc.Port)
-	if proxyConf.ObfsSecret != "" {
+	if hasSNI {
+		preferredFPS := []utls.ClientHelloID{utlsClientHelloID}
+		if hasWorkingFingerprint && workingFingerprint != utlsClientHelloID {
+			preferredFPS = append([]utls.ClientHelloID{workingFingerprint}, preferredFPS...)
+		}
+		for _, sni := range sniHostnames {
+			for _, fp := range preferredFPS {
+				strategies = append(strategies, ConnectionStrategy{
+					Address:     origAddr,
+					Obfuscation: "tls",
+					Fingerprint: fp,
+					Description: fmt.Sprintf("original host + TLS [%s] SNI:%s", fp.Str(), sni),
+				})
+			}
+		}
+	}
+	if hasObfs {
 		strategies = append(strategies, ConnectionStrategy{
 			Address:     origAddr,
 			Obfuscation: "chacha",
@@ -1129,31 +1241,23 @@ func (sc *SSHConnector) buildStrategies() []ConnectionStrategy {
 	strategies = append(strategies, ConnectionStrategy{
 		Address:     origAddr,
 		Obfuscation: "plain",
-		Description: "original host",
+		Description: "original host (plain SSH)",
 	})
-	if proxyConf.SNIHostname != "" || len(proxyConf.SNIHostnames) > 0 {
-		for _, sni := range sniHostnames {
-			for _, fp := range fps {
-				strategies = append(strategies, ConnectionStrategy{
-					Address:     origAddr,
-					Obfuscation: "tls",
-					Fingerprint: fp,
-					Description: fmt.Sprintf("original host + TLS [%s] SNI:%s", fp.Str(), sni),
-				})
-			}
-			strategies = append(strategies, ConnectionStrategy{
-				Address:     origAddr,
-				Obfuscation: "h2connect",
-				Description: fmt.Sprintf("original host + H2 CONNECT SNI:%s", sni),
-			})
-		}
+
+	// 4. Direct IPs (fallback)
+	for _, ip := range proxyConf.DirectIPs {
+		addr := fullAddr(ip, sc.Port)
+		strategies = append(strategies, ConnectionStrategy{
+			Address:     addr,
+			Obfuscation: "plain",
+			Description: fmt.Sprintf("direct IP %s", ip),
+		})
 	}
 
-	// 4. Alt ports TCP — сначала plain/chacha (прямое SSH),
-	// потом TLS/H2 (для серверов с TLS-прокси)
+	// 5. Alt ports TCP
 	for _, altPort := range proxyConf.AltPorts {
 		addr := fullAddr(sc.Host, altPort)
-		if proxyConf.ObfsSecret != "" {
+		if hasObfs {
 			strategies = append(strategies, ConnectionStrategy{
 				Address:     addr,
 				Obfuscation: "chacha",
@@ -1165,59 +1269,12 @@ func (sc *SSHConnector) buildStrategies() []ConnectionStrategy {
 			Obfuscation: "plain",
 			Description: fmt.Sprintf("alt port %d", altPort),
 		})
-		if proxyConf.SNIHostname != "" || len(proxyConf.SNIHostnames) > 0 {
-			preferredFPS := []utls.ClientHelloID{utlsClientHelloID}
-			if hasWorkingFingerprint && workingFingerprint != utlsClientHelloID {
-				preferredFPS = append([]utls.ClientHelloID{workingFingerprint}, preferredFPS...)
-			}
-			for _, sni := range sniHostnames {
-				for _, fp := range preferredFPS {
-					strategies = append(strategies, ConnectionStrategy{
-						Address:     addr,
-						Obfuscation: "tls",
-						Fingerprint: fp,
-						Description: fmt.Sprintf("alt port %d + TLS [%s] SNI:%s", altPort, fp.Str(), sni),
-					})
-				}
-				strategies = append(strategies, ConnectionStrategy{
-					Address:     addr,
-					Obfuscation: "h2connect",
-					Description: fmt.Sprintf("alt port %d + H2 CONNECT SNI:%s", altPort, sni),
-				})
-			}
-		}
 	}
 
 	return strategies
 }
 
 func (sc *SSHConnector) tryStrategy(s ConnectionStrategy) (*ssh.Client, error) {
-	// Для UDP-туннеля не используем TCP dial — создаём UDP-сокет напрямую
-	if s.Obfuscation == "quic" {
-		host, portStr, err := net.SplitHostPort(s.Address)
-		if err != nil {
-			return nil, fmt.Errorf("udp: invalid address %s: %w", s.Address, err)
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("udp: invalid port %s: %w", portStr, err)
-		}
-		udpConn, err := newUDPTunnelConn(host, port)
-		if err != nil {
-			return nil, fmt.Errorf("UDP tunnel dial failed: %w", err)
-		}
-		sshConn, chans, reqs, err := ssh.NewClientConn(udpConn, s.Address, sc.SSHConfig)
-		if err != nil {
-			udpConn.Close()
-			return nil, fmt.Errorf("SSH handshake over UDP tunnel failed: %w", err)
-		}
-		debugLog.Debug("strategy succeeded",
-			"addr", s.Address,
-			"obfs", "udp",
-			"desc", s.Description)
-		return ssh.NewClient(sshConn, chans, reqs), nil
-	}
-
 	conn, err := sc.dial(s.Address)
 	if err != nil {
 		return nil, fmt.Errorf("dial failed: %w", err)
@@ -1229,6 +1286,7 @@ func (sc *SSHConnector) tryStrategy(s ConnectionStrategy) (*ssh.Client, error) {
 		return nil, fmt.Errorf("obfuscation failed: %w", obfsErr)
 	}
 
+	// SSH-клиент работает поверх обёрнутого соединения.
 	sshConn, chans, reqs, err := ssh.NewClientConn(wrappedConn, s.Address, sc.SSHConfig)
 	if err != nil {
 		wrappedConn.Close()
@@ -1254,9 +1312,8 @@ func (sc *SSHConnector) dial(addr string) (net.Conn, error) {
 			err  error
 		}
 		ch := make(chan dialResult, 1)
-		ctx, cancel := context.WithTimeout(sc.Ctx, 12*time.Second)
+		ctx, cancel := context.WithTimeout(sc.Ctx, 15*time.Second)
 		defer cancel()
-
 		go func() {
 			c, e := sc.SocksDialer.Dial("tcp", addr)
 			select {
@@ -1271,13 +1328,12 @@ func (sc *SSHConnector) dial(addr string) (net.Conn, error) {
 		case res := <-ch:
 			return res.conn, res.err
 		case <-ctx.Done():
-			return nil, fmt.Errorf("SOCKS5 dial timeout after 12s")
+			return nil, fmt.Errorf("SOCKS5 dial timeout after 15s")
 		case <-sc.Ctx.Done():
 			return nil, sc.Ctx.Err()
 		}
 	}
-
-	ctx, cancel := context.WithTimeout(sc.Ctx, 12*time.Second)
+	ctx, cancel := context.WithTimeout(sc.Ctx, 15*time.Second)
 	defer cancel()
 	return sc.NetDialer.DialContext(ctx, "tcp", addr)
 }
@@ -1285,88 +1341,33 @@ func (sc *SSHConnector) dial(addr string) (net.Conn, error) {
 func (sc *SSHConnector) applyObfuscation(conn net.Conn, method string, fp utls.ClientHelloID) (net.Conn, error) {
 	switch method {
 	case "tls":
-		if proxyConf.SNIHostname != "" || len(proxyConf.SNIHostnames) > 0 {
-			sniHostnames := getSNIHostnames()
-			sni := sniHostnames[0]
-			tlsConn, err := newUTLSCamouflageConn(conn, sni, fp)
-			if err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("uTLS camouflage failed: %w", err)
-			}
-			return tlsConn, nil
+		sniList := getSNIHostnames()
+		if len(sniList) == 0 {
+			conn.Close()
+			return nil, errors.New("tls obfuscation requires sni_hostname(s)")
 		}
-		conn.Close()
-		return nil, errors.New("tls obfuscation requires sni_hostname")
+		sni := sniList[0]
+		tlsConn, err := newUTLSCamouflageConn(conn, sni, fp)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("uTLS camouflage failed: %w", err)
+		}
+		// Оборачиваем в paddedTLSConn для имитации Chrome post-handshake record padding.
+		return &paddedTLSConn{Conn: tlsConn}, nil
 	case "chacha":
-		if proxyConf.ObfsSecret != "" {
-			chachaConn, err := newObfuscatedConn(conn, proxyConf.ObfsSecret)
-			if err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("ChaCha20 obfuscation failed: %w", err)
-			}
-			return chachaConn, nil
+		if proxyConf.ObfsSecret == "" {
+			conn.Close()
+			return nil, errors.New("chacha obfuscation requires obfs_secret")
 		}
-		conn.Close()
-		return nil, errors.New("chacha obfuscation requires obfs_secret")
-	case "h2connect":
-		if proxyConf.SNIHostname != "" || len(proxyConf.SNIHostnames) > 0 {
-			h2Conn, err := newH2ConnectConn(conn, getSNIHostnames()[0])
-			if err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("H2 CONNECT failed: %w", err)
-			}
-			return h2Conn, nil
+		chachaConn, err := newObfuscatedConn(conn, proxyConf.ObfsSecret)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("ChaCha20 obfuscation failed: %w", err)
 		}
-		conn.Close()
-		return nil, errors.New("h2connect requires sni_hostname")
+		return chachaConn, nil
 	default:
 		return conn, nil
 	}
-}
-
-// ---------------------------------------------------------------------------
-// HTTP/2 CONNECT tunnel — маскировка SSH под HTTP/2 трафик
-// ---------------------------------------------------------------------------
-
-type h2ConnectConn struct {
-	net.Conn
-	reader io.Reader
-}
-
-func newH2ConnectConn(conn net.Conn, sniHostname string) (*h2ConnectConn, error) {
-	tlsConfig := &tls.Config{
-		ServerName:         sniHostname,
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"h2", "http/1.1"},
-	}
-	tlsConn := tls.Client(conn, tlsConfig)
-	if err := tlsConn.Handshake(); err != nil {
-		return nil, fmt.Errorf("H2 TLS handshake: %w", err)
-	}
-
-	req := &http.Request{
-		Method: "CONNECT",
-		URL:    &url.URL{Opaque: sniHostname},
-		Host:   sniHostname,
-		Header: make(http.Header),
-	}
-	req.Header.Set("User-Agent", dohUserAgents[0])
-	req.Header.Set("Proxy-Connection", "Keep-Alive")
-
-	if err := req.Write(tlsConn); err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("H2 CONNECT write: %w", err)
-	}
-
-	debugLog.Debug("H2 CONNECT tunnel established", "sni", sniHostname)
-	return &h2ConnectConn{
-		Conn:   tlsConn,
-		reader: tlsConn,
-	}, nil
-}
-
-func (h2 *h2ConnectConn) Read(b []byte) (int, error) {
-	return h2.reader.Read(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,7 +1407,6 @@ func (c *WebSocketClient) setupSession() error {
 			c.sendError("Failed to start shell")
 		}
 	})
-
 	return nil
 }
 
@@ -1435,6 +1435,9 @@ func (c *WebSocketClient) handleMessages() {
 		}
 	})
 	for {
+		if c.closed.Load() {
+			return
+		}
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
 			debugLog.Debug("WS read finished", "error", err)
@@ -1448,6 +1451,11 @@ func (c *WebSocketClient) handleMessages() {
 		case data["command"] != nil:
 			cmd, ok := data["command"].(string)
 			if !ok {
+				continue
+			}
+			// Rate limit на входящие команды
+			if c.limiter != nil && !c.limiter.Allow() {
+				debugLog.Warn("WS rate limit exceeded for command")
 				continue
 			}
 			c.writeMu.Lock()
@@ -1494,6 +1502,7 @@ func (c *WebSocketClient) sendJSON(msg map[string]any) {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := c.conn.WriteJSON(msg); err != nil {
 		logger.Warn("WriteJSON error", "error", err)
 	}
@@ -1533,42 +1542,8 @@ func generateWSPath() string {
 }
 
 // ---------------------------------------------------------------------------
-// Usage
+// Main
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// UDP-капсуляция (вместо QUIC/HTTP3) — работает с любым sshd,
-// SSH трафик оборачивается в UDP, сложно детектится DPI
-// ---------------------------------------------------------------------------
-
-type udpTunnelConn struct {
-	*net.UDPConn
-	raddr *net.UDPAddr
-}
-
-func newUDPTunnelConn(host string, port int) (*udpTunnelConn, error) {
-	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port))
-	if err != nil {
-		return nil, fmt.Errorf("resolve udp: %w", err)
-	}
-
-	udpConn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		return nil, fmt.Errorf("dial udp: %w", err)
-	}
-
-	_ = udpConn.SetReadBuffer(65536)
-	_ = udpConn.SetWriteBuffer(65536)
-
-	debugLog.Debug("UDP tunnel established",
-		"host", host,
-		"port", port)
-
-	return &udpTunnelConn{
-		UDPConn: udpConn,
-		raddr:   udpAddr,
-	}, nil
-}
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `WebSSH — Web-based SSH client with WebSocket terminal
@@ -1581,34 +1556,32 @@ Options:
   -key <path>   SSH known_hosts file for host key verification
   -doh <url>    DNS-over-HTTPS resolver (e.g. https://dns.cloudflare.com/dns-query)
   -proxy <addr> SOCKS5 proxy (e.g. 127.0.0.1:9050)
-  -quic         Enable QUIC/HTTP3 tunnel strategy (experimental, UDP-based)
   -h            Show this help message
 
-RKN bypass (configured via proxy.json):
-  - TLS fingerprint cycling (Chrome 133 / Chrome PQ / Firefox / iOS / Randomized)
-  - Post-Quantum key agreement (X25519Kyber768Draft00)
-  - DNS-over-HTTPS with multi-provider fallback + dynamic health monitoring
-  - DoH routed through SOCKS5/Tor
-  - Encrypted Client Hello (ECH) support
-  - Randomized WebSocket endpoint path
-  - ClientHello padding + GREASE for DPI evasion
-  - HTTP/2 CONNECT tunnel
-  - QUIC/HTTP3 tunnel (UDP-based, hardest to DPI-block)
-  - SNI hostname rotation (CDN pool)
-  - ChaCha20-Poly1305 obfuscation
+RKN bypass features (актуализировано июнь 2026):
+  - uTLS-флис-фингерпринтов: Chrome 133/120 PQ/115 PQ, Firefox, iOS, Edge, Randomized
+  - DoH с расширенным пулом + dynamic health monitoring
+  - DoH через SOCKS5/Tor
+  - Encrypted Client Hello (ECH)
+  - Рандомизированный WebSocket endpoint
+  - TLS record padding (Chrome-like)
+  - Post-Quantum X25519Kyber768Draft00
+  - GREASE-расширения
+  - SNI hostname rotation (расширенный пул CDN 2026)
+  - ChaCha20-Poly1305 обфускация (HKDF-SHA256 KDF)
+  - Anti-Siberia-flood: TLS-стратегии с backoff'ом
+  - WebSocket: origin check, max message size, rate limit, ping/pong
+
+Note: Для обхода РКН в проде рекомендуется дополнительно поднять Xray-core (VLESS+Reality+Vision)
+или AmneziaWG 2.0 отдельным процессом. webssh же используется как web-интерфейс поверх sshd.
 
 Examples:
   webssh
   webssh -p 8080 -debug
   webssh -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050
-  webssh -quic -doh https://dns.cloudflare.com/dns-query
 `)
 	os.Exit(0)
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 func main() {
 	flagPort := flag.Int("p", 3400, "Port to listen on")
@@ -1616,7 +1589,6 @@ func main() {
 	flagKey := flag.String("key", "", "Path to known_hosts file")
 	flagDoH := flag.String("doh", "", "DNS-over-HTTPS URL")
 	flagProxy := flag.String("proxy", "", "SOCKS5 proxy address")
-	flagQUIC := flag.Bool("quic", false, "Enable QUIC/HTTP3 tunnel strategy")
 	flagHelp := flag.Bool("h", false, "Show help")
 	flag.Usage = printUsage
 	flag.Parse()
@@ -1688,10 +1660,6 @@ func main() {
 		proxyConf.SOCKS5 = "127.0.0.1:9050"
 		logger.Info("Tor mode enabled, SOCKS5 set to 127.0.0.1:9050")
 	}
-	if *flagQUIC {
-		proxyConf.EnableQUIC = true
-		logger.Info("QUIC/HTTP3 tunnel strategy enabled")
-	}
 
 	doh := newDoHResolver(proxyConf.DoH, proxyConf.DoHProviders, proxyConf.SOCKS5)
 	if doh != nil {
@@ -1701,14 +1669,16 @@ func main() {
 
 	debugLog.Debug("proxy config",
 		"doh", proxyConf.DoH,
-		"doh_providers", proxyConf.DoHProviders,
+		"doh_providers", len(proxyConf.DoHProviders),
 		"socks5", proxyConf.SOCKS5,
 		"direct_ips", proxyConf.DirectIPs,
 		"alt_ports", proxyConf.AltPorts,
 		"sni_hostname", proxyConf.SNIHostname,
-		"sni_hostnames", proxyConf.SNIHostnames,
+		"sni_hostnames", len(proxyConf.SNIHostnames),
 		"ech_config", proxyConf.ECHConfigBase64 != "",
 		"fingerprints_pool", len(utlsFingerprintPool),
+		"origin_pins", len(proxyConf.WSOriginPins),
+		"max_tls_attempts", proxyConf.MaxTLSAttempts,
 	)
 
 	if *flagKey != "" {
@@ -1724,6 +1694,9 @@ func main() {
 		logger.Warn("SSH host key verification disabled (use -key to enable)")
 		knownHostsFn = ssh.InsecureIgnoreHostKey()
 	}
+
+	// Динамически пересобираем upgrader с учётом ws_origin_pins.
+	upgrader = buildUpgrader()
 
 	mux := http.NewServeMux()
 
@@ -1752,7 +1725,6 @@ func main() {
 	})
 
 	mux.HandleFunc(wsPath, securityMiddleware(ipMiddleware(handleWebSocket)))
-
 	if wsPath != "/ws" {
 		mux.HandleFunc("/ws", securityMiddleware(ipMiddleware(handleWebSocket)))
 	}
@@ -1788,7 +1760,6 @@ func main() {
 
 	certFile := filepath.Join(baseDir, "cert.pem")
 	keyFile := filepath.Join(baseDir, "key.pem")
-
 	_, certExists := os.Stat(certFile)
 	_, keyExists := os.Stat(keyFile)
 

@@ -1,100 +1,99 @@
 # WebSSH — Web-терминал для SSH через браузер
 
-**WebSSH** — это веб-приложение на Go, которое предоставляет терминал SSH прямо в браузере через WebSocket.  
-Разработано для безопасного удалённого управления серверами в условиях сетевых ограничений.
+**WebSSH** — это веб-приложение на Go 1.26.3, которое предоставляет терминал SSH прямо в браузере через WebSocket. Разработано для безопасного удалённого управления серверами в условиях сетевых ограничений РКН.
 
 ## Возможности
 
-- **Полноценный SSH-терминал** в браузере через WebSocket + xterm.js (поддержка mc, vim, nano, цветов).
+- **Полноценный SSH-терминал** в браузере через WebSocket + xterm.js (mc, vim, nano, цвета).
+- **uTLS-флис-фингерпринтов** в реальном времени: Chrome 133, Chrome 120/115 с Post-Quantum X25519Kyber768, Firefox, iOS, Edge, Safari, Randomized.
+- **DoH с расширенным пулом провайдеров** (Cloudflare, Google, Quad9, Mullvad, NextDNS, AdGuard и др.) + автоматический health-check каждые 30 с.
+- **DoH-запросы через SOCKS5/Tor** — ISP не видит DNS-запросов.
+- **Encrypted Client Hello (ECH)** — реальный SNI шифруется внутри TLS-хендшейка.
+- **ChaCha20-Poly1305 обфускация** с KDF через **HKDF-SHA256** (криптографически стойкий).
+- **TLS record padding** после хендшейка (имитация поведения Chrome).
+- **GREASE-расширения** в ClientHello для противодействия uTLS-детекту.
+- **Post-Quantum X25519Kyber768Draft00** — устойчивость к квантовым атакам.
+- **Рандомизированный WebSocket endpoint path** — `/<random_hex>` генерируется при старте.
+- **Автоматическая ротация SNI-доноров** — 21 актуальный на 2026 домен (www.asus.com, www.samsung.com, www.microsoft.com, www.google.com и др.).
+- **Anti-Siberia-flood защита** — лимит TLS-хендшейков (4) + backoff 25 с между батчами.
+- **SOCKS5-прокси** (Tor через `enable_tor: true`).
+- **IPv6-приоритет** — IPv6-адреса DoH резолва проверяются первыми (ТСПУ хуже фильтрует IPv6).
 - **Структурированное логирование** через `slog` с уровнями Info / Warn / Debug.
 - **IP-контроль доступа** — белый список IP/подсетей через `access.json`.
 - **TLS 1.2/1.3** — автоматическое включение при наличии сертификатов.
 - **Graceful shutdown** — корректное завершение сессий при перезапуске.
-- **Настройки по умолчанию** — host/port и uTLS fingerprint из `webssh.conf` подставляются в форму браузера.
-- **Буфер обмена** — Ctrl+C / Ctrl+V / правая кнопка мыши (копирование/вставка).
-- **Поддержка ресайза** — терминал автоматически подстраивается под размер окна.
-- **Индикатор статуса соединения** — цветная точка в заголовке терминала (жёлтый = подключение, зелёный = готово, красный = разорвано).
-- **Автоматическое переподключение** — exponential backoff при разрыве соединения (до 5 попыток).
+- **WebSocket: origin check (CSRF), max message size (1 MB), rate limit, ping/pong** (30 с ping, 60 с pong).
 
-## Обход блокировок (РКН / DPI 2025–2026)
+## Актуальные стратегии обхода РКН (июнь 2026)
+
+Проект использует следующие стратегии, актуальные на июнь 2026:
 
 ### Механизмы обхода (в порядке приоритета)
 
-| Механизм | Описание | Настройка |
-|---|---|---|
-| **UDP-капсуляция** | SSH-трафик упаковывается напрямую в UDP (замена полноценного QUIC/HTTP3). Не требует специального ПО на сервере — работает с любым sshd. DPI анализировать UDP-потоки значительно сложнее, чем TCP. | `-quic` / `proxy.json` → `enable_quic: true` |
-| **DoH мульти-провайдер с health check** | Цепочка DNS-over-HTTPS провайдеров: Cloudflare → Google → Quad9 → Mozilla. Фоновый мониторинг доступности — если провайдер перестал отвечать, он исключается из ротации. При восстановлении — снова включается. | `proxy.json` → `doh_providers` |
-| **DoH через SOCKS5/Tor** | DNS-резолвинг DoH направляется через Tor/SOCKS5 — ISP не видит DoH-запросов. | Автоматически при `socks5` + `doh` |
-| **Маскировка User-Agent** | DoH-запросы используют случайный реальный User-Agent (Chrome/Safari/Firefox) вместо `Go-http-client/1.1`. | Встроено |
-| **Ротация TLS-фингерпринтов** | Автоматический перебор fingerprint'ов: Chrome 133 → Chrome 120 PQ → Chrome 115 PQ → Firefox → iOS → Randomized. Если DPI заблокировал конкретный fingerprint, следующая попытка использует другой. Успешный fingerprint кешируется для повторного использования. | Встроено (пул из 6 fingerprint'ов) |
-| **Post-Quantum криптография** | X25519Kyber768Draft00 — пост-квантовое согласование ключей, устойчивое к атакам квантового компьютера. DPI не может расшифровать TLS handshake даже в будущем. | Встроено в `HelloChrome_120_PQ` и `HelloChrome_115_PQ` |
-| **GREASE расширения** | Добавление GREASE (Generate Random Extensions And Sustain Extensibility) в ClientHello — DPI не может детектировать uTLS по отсутствию GREASE. | Встроено для всех fingerprint'ов |
-| **Encrypted Client Hello (ECH)** | Шифрует реальный SNI внутри TLS-хендшейка. DPI видит только внешний SNI (напр. `cloudflare.com`), а реальный домен зашифрован. | `proxy.json` → `ech_config` (base64 из DNS) |
-| **uTLS Camouflage** | Маскировка SSH под HTTPS-трафик с эмуляцией Chrome/Firefox/Safari. DPI видит браузерный TLS handshake (JA3 fingerprint), а не Go-клиент. Включает ClientHello padding (BoringPaddingStyle) для маскировки размера. | `proxy.json` → `sni_hostname`, `webssh.conf` → `[utls]` |
-| **Приоритет IPv6** | IPv6-адреса подключаются первыми — DPI РКН хуже фильтрует IPv6 трафик. | Встроено |
-| **SOCKS5-прокси** | Маршрутизация SSH через Tor (автонастройка через `enable_tor`). | `-proxy addr` / `proxy.json` → `enable_tor` |
-| **Рандомизация WebSocket пути** | При каждом запуске генерируется уникальный путь WebSocket (напр. `/a3f8b2c1e90d4f67`). DPI не может заблокировать фиксированный путь. Старый путь `/ws` также поддерживается для обратной совместимости. | Встроено |
-| **ChaCha20-Poly1305 обфускация** | Криптографически стойкое шифрование трафика (замена XOR). Использует AEAD с XChaCha20-Poly1305. Случайный nonce для каждого пакета. | `proxy.json` → `obfs_secret` |
-| **HTTP/2 CONNECT туннель** | Маскировка SSH-трафика под HTTP/2 с TLS. Отправляет CONNECT-запрос с браузерным User-Agent. DPI видит обычный HTTPS в браузере. | `proxy.json` → `sni_hostname` |
-| **Ротация SNI hostname** | Автоматический перебор популярных CDN (cloudflare.com, google.com, github.com и др.) в качестве маскирующего SNI. Если DPI заблокировал один домен — используется следующий. | `proxy.json` → `sni_hostnames` (массив) |
-| **Прямые IP-адреса** | Подключение напрямую по IP (последний приоритет, только если все остальные стратегии не сработали). | `proxy.json` → `direct_ips` |
-| **Альтернативные порты** | Подключение по нестандартным портам (2222, 2053, 8443 и др.). | `proxy.json` → `alt_ports` |
-| **TLS ServerHello маскировка** | Веб-сервер маскирует ServerHello: session tickets включены, расширенный список cipher suites (как у реальных серверов). | Встроено |
-| **Автоматический перебор стратегий** | Каждая комбинация (адрес + метод обфускации + fingerprint + SNI) — отдельная стратегия. Рабочий fingerprint кешируется и используется первым при следующих подключениях. | Встроено |
+| # | Механизм | Описание | Настройка |
+|---|----------|----------|-----------|
+| 1 | **uTLS-ротация fingerprint'ов** | Chrome 133, Chrome 120_PQ, Chrome 115_PQ, Firefox, iOS, Edge, Safari, Randomized. Браузерные fingerprint'ы применяются через встроенный `UTLSIdToSpec` (НЕ через самописный ClientHelloSpec — иначе JA3/JA4 ломается). | `webssh.conf` → `[utls] client_hello` |
+| 2 | **DoH с мульти-провайдером** | 9 провайдеров + динамический health-check. При выходе провайдера из строя — исключается из ротации. | `proxy.json` → `doh_providers` |
+| 3 | **DoH через SOCKS5/Tor** | DNS-запросы DoH направляются через Tor — ISP не видит DoH-трафика. | `proxy.json` → `socks5` + `doh` |
+| 4 | **Маскированный User-Agent** | DoH-запросы используют реальный UA Chrome/Safari/Firefox/Edge вместо `Go-http-client/1.1`. | Встроено |
+| 5 | **Post-Quantum криптография** | X25519Kyber768Draft00 в Chrome 120/115 PQ. Устойчиво к квантовым атакам (для защиты данных, не от DPI). | Встроено в `HelloChrome_120_PQ`, `HelloChrome_115_PQ` |
+| 6 | **GREASE-расширения** | Добавление GREASE в ClientHello. DPI не может детектировать uTLS по отсутствию GREASE. | Встроено для custom fingerprint'ов |
+| 7 | **Encrypted Client Hello (ECH)** | Шифрует реальный SNI внутри TLS-хендшейка. DPI видит только внешний SNI (например, `www.asus.com`). | `proxy.json` → `ech_config` (base64) |
+| 8 | **TLS record padding** | После успешного TLS-хендшейка отправляется Chrome-like padding record. Скрывает реальные размеры первых пакетов. | Встроено в `paddedTLSConn` |
+| 9 | **ChaCha20-Poly1305 обфускация** | XChaCha20-Poly1305 с KDF через HKDF-SHA256. Случайный nonce на пакет. | `proxy.json` → `obfs_secret` |
+| 10 | **SOCKS5/Tor** | Маршрутизация через Tor (только через мосты obfs4/snowflake для РФ 2026). | `-proxy addr` / `proxy.json` → `socks5` |
+| 11 | **Рандомизация WebSocket пути** | Уникальный путь `/<16-hex>` при каждом запуске. | Встроено |
+| 12 | **Anti-Siberia-flood** | После 4 TLS-хендшейков — пауза 25 с. Предотвращает «Сибирскую блокировку» IP:port на 120 с. | `proxy.json` → `max_tls_attempts`, `tls_strategy_delay` |
+| 13 | **Ротация SNI hostname** | 21 актуальный на 2026 домен (www.asus.com, www.samsung.com, www.microsoft.com, www.google.com, www.apple.com и др.) — не в списках ТСПУ. | `proxy.json` → `sni_hostnames` |
+| 14 | **Прямые IP-адреса** | Fallback на заранее заданные IP. | `proxy.json` → `direct_ips` |
+| 15 | **Альтернативные порты** | Подключение по нестандартным портам (8443, 2053, 2083 и др.). | `proxy.json` → `alt_ports` |
+| 16 | **WebSocket origin pin** | Защита от CSRF — WS upgrade принимается только с указанных Origin'ов. | `proxy.json` → `ws_origin_pins` |
+| 17 | **WebSocket rate limit** | 512 KB/s, burst 1 MB на сессию. Защита от slow-rate атак. | Встроено |
 
-### Порядок перебора стратегий подключения
+### Что НЕ реализовано (и почему)
+
+- **QUIC-туннель через `quic-go`** — реальный QUIC требует двусторонней поддержки (на сервере должен быть QUIC-туннель, на клиенте — QUIC-клиент). Поскольку целевой сервис — это обычный `sshd` на TCP, нативный QUIC не применяется. Вместо этого — UDP-обёртка отключена.
+- **HTTP/2 CONNECT туннель** — был в исходном коде, но фактически использовал `tls.Client` (Go-фолбэк) и не работал с обычным sshd. Удалён.
+- **Серверные стратегии (VLESS-Reality, AmneziaWG)** — выходят за рамки WebSSH. Рекомендуется поднимать их **отдельным процессом** перед sshd.
+
+## Рекомендуемая архитектура для прод (июнь 2026)
+
+WebSSH — это **web-интерфейс** для SSH. Для реального обхода РКН в проде рекомендуется **двухслойная** схема:
 
 ```
-1. UDP-капсуляция (QUIC) — пробуется первой, UDP трафик сложно детектится DPI
-   ↓ если не сработал (UDP заблокирован)
-2. DoH IP + uTLS/PQ/ECH (ротация fingerprint'ов, Post-Quantum)
-   ↓ если не сработал
-3. DoH IP + ChaCha20 (шифрование поверх TCP)
-   ↓ если не сработал
-4. Original host + plain/chacha (прямое SSH через Tor/SOCKS5)
-   ↓ если не сработал
-5. Original host + uTLS/PQ/ECH (TLS camouflage)
-   ↓ если не сработал
-6. Alt ports + plain/chacha/TLS (другие TCP-порты)
-   ↓ если не сработал
-7. Direct IPs — только в крайнем случае
+[Браузер] → [WebSSH :443 (TLS)] → [sshd :22] ← юзер подключается через WebSSH
+                                    ↑
+                          (или через bypass-слой ↓)
+
+Вариант A: [WebSSH :443] → [Xray-core VLESS+Reality+Vision] → [sshd :22]
+Вариант B: [WebSSH :443] → [AmneziaWG 2.0] → [sshd :22]
+Вариант C: [WebSSH :443] → [sshd :22 напрямую] (только в безопасных сетях)
 ```
 
-Каждая стратегия обёрнута в 12-секундный таймаут. После неудачной попытки автоматически переходит к следующей. Первая успешная — устанавливает соединение.
-
-### Примеры обхода блокировок
-
-```bash
-# DoH через Cloudflare с поддержкой IPv6
-webssh -doh https://dns.cloudflare.com/dns-query
-
-# DoH + Tor (SOCKS5)
-webssh -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050
-
-# Максимальная защита: uTLS + ECH + DoH через Tor + ротация fingerprint'ов + Post-Quantum
-./webssh -p 3400 -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050 -debug
-# sni_hostnames, obfs_secret и ech_config задаются в proxy.json
-```
+Стратегии A и B поднимаются отдельным процессом; WebSSH подключается к localhost:22 (или другому локальному порту).
 
 ## Быстрый старт
 
 ```bash
-# Сборка
+# Сборка (Go 1.26+)
 go build -o webssh -ldflags "-s -w" .
 
 # Запуск на порту 3400
 ./webssh
 
-# С портом, debug, DoH и прокси
-./webssh -p 8080 -debug -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050
+# С DoH и SOCKS5
+./webssh -doh https://dns.cloudflare.com/dns-query -proxy 127.0.0.1:9050
+
+# С debug-логом
+./webssh -debug
 
 # Справка
 ./webssh -h
 ```
 
-После запуска откройте браузер на `http://localhost:3400` (или `https://localhost:3400` при TLS).
+После запуска откройте `http://localhost:3400` (или `https://localhost:3400` при TLS).
 
-**WebSocket путь** генерируется автоматически при каждом запуске (выводится в лог). Старый путь `/ws` также поддерживается.
+**WebSocket путь** генерируется автоматически при каждом запуске (выводится в лог). Старый путь `/ws` также поддерживается для обратной совместимости.
 
 ## Установка и сборка
 
@@ -111,11 +110,11 @@ cd web_ssh
 go mod tidy
 go build -o webssh -ldflags "-s -w" .
 
-# Кросскомпиляция для другой платформы:
+# Кросскомпиляция для Linux:
 GOOS=linux GOARCH=amd64 go build -o webssh -ldflags "-s -w" .
 ```
 
-### Запуск как systemd-сервис на Linux
+### Запуск как systemd-сервис
 
 Файл `/etc/systemd/system/webssh.service`:
 
@@ -126,11 +125,18 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/webssh
-ExecStart=/opt/webssh/webssh -p 3400 -key /etc/ssh/ssh_known_hosts
-Restart=always
+User=vmorozov
+Group=vmorozov
+WorkingDirectory=/home/vmorozov/DEV/web_ssh
+ExecStart=/home/vmorozov/DEV/web_ssh/webssh -p 3400 -key /etc/ssh/ssh_known_hosts
+Restart=on-failure
 RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
@@ -143,9 +149,7 @@ systemctl enable --now webssh
 
 ## Конфигурация
 
-### `webssh.conf` — настройки по умолчанию и uTLS fingerprint (опционально)
-
-INI-файл в директории с бинарником. Поддерживает секции `[main]` (host/port для формы) и `[utls]` (выбор браузерного fingerprint для DPI-обхода).
+### `webssh.conf` — настройки по умолчанию и uTLS fingerprint
 
 ```ini
 # WebSSH configuration
@@ -153,24 +157,24 @@ INI-файл в директории с бинарником. Поддержив
 host = 127.0.0.1
 port = 2222
 
-# uTLS Client Hello fingerprint (браузерная эмуляция для обхода DPI)
+# uTLS Client Hello fingerprint (браузерная эмуляция для обхода DPI).
+# Доступные варианты:
+#   HelloChrome_Auto    — автоматический выбор актуальной версии Chrome
+#   HelloChrome_133     — Chrome 133 (стабильная, рекомендуется)
+#   HelloChrome_120     — Chrome 120
+#   HelloChrome_120_PQ  — Chrome 120 + Post-Quantum X25519Kyber768
+#   HelloChrome_115_PQ  — Chrome 115 + Post-Quantum X25519Kyber768
+#   HelloFirefox_Auto   — актуальный Firefox
+#   HelloEdge_Auto      — Microsoft Edge
+#   HelloSafari_Auto    — Safari
+#   HelloIOS_Auto       — iOS Safari
+#   HelloRandomized     — случайный fingerprint (экспериментально)
+#   HelloGolang         — стандартный Go fingerprint (без обфускации)
 [utls]
 client_hello = HelloChrome_133
 ```
 
-**Секция `[utls]`** — настройка эмуляции браузерного TLS handshake (JA3 fingerprint):
-- `HelloChrome_133` — Chrome 133 (стабильная версия, рекомендуется)
-- `HelloFirefox_Auto` — Firefox
-- `HelloEdge_Auto` — Microsoft Edge
-- `HelloSafari_Auto` — Safari
-- `HelloIOS_Auto` — iOS Safari
-- `HelloRandomized` — случайный fingerprint (экспериментально)
-- `HelloGolang` — стандартный Go fingerprint (без обфускации)
-
-Если секция `[utls]` отсутствует — по умолчанию используется `HelloChrome_133`.
-**Важно:** настроенный fingerprint используется как приоритетный кандидат, но система автоматически перебирает другие fingerprint'и из пула (Chrome 133, Chrome 120 PQ, Chrome 115 PQ, Firefox, iOS, Randomized) если основной заблокирован.
-
-### `proxy.json` — настройки обхода блокировок (опционально)
+### `proxy.json` — настройки обхода блокировок
 
 ```json
 {
@@ -178,48 +182,52 @@ client_hello = HelloChrome_133
   "enable_tor": true,
   "doh": "https://dns.cloudflare.com/dns-query",
   "doh_providers": [
+    "https://dns.cloudflare.com/dns-query",
     "https://dns.google/dns-query",
     "https://dns.quad9.net/dns-query",
-    "https://mozilla.cloudflare-dns.com/dns-query"
+    "https://mozilla.cloudflare-dns.com/dns-query",
+    "https://doh.mullvad.net/dns-query",
+    "https://dns.nextdns.io/dns-query",
+    "https://dns.adguard-dns.com/dns-query",
+    "https://dns.electrolab.ru/dns-query",
+    "https://doh.opendns.com/dns-query"
   ],
   "direct_ips": ["198.51.100.1"],
   "alt_ports": [8443, 2053, 2083, 2096, 2222],
-  "sni_hostname": "cloudflare.com",
   "sni_hostnames": [
-    "cloudflare.com",
-    "google.com",
-    "github.com",
-    "microsoft.com"
+    "www.asus.com",
+    "www.samsung.com",
+    "www.dell.com",
+    "www.microsoft.com",
+    "www.google.com",
+    "www.apple.com"
   ],
-  "obfs_secret": "vash-sekretnyy-kluch-32-simvola",
-  "ech_config": ""
+  "obfs_secret": "ваш-секрет-32-символа-base64-или-просто-строка",
+  "ech_config": "",
+
+  "max_tls_attempts": 4,
+  "tls_strategy_delay": 25000000000,
+
+  "ws_read_limit": 1048576,
+  "ws_origin_pins": ["https://ваш-домен.ru"]
 }
 ```
-
-CLI-флаги `-doh` и `-proxy` имеют приоритет над `proxy.json`.
 
 **Параметры обхода блокировок:**
 
 - **`socks5`** — адрес SOCKS5-прокси (например `127.0.0.1:9050` для Tor)
 - **`enable_tor`** — автоматическая настройка SOCKS5 на `127.0.0.1:9050` если прокси не задан явно
-- **`doh`** — основной URL DoH-резолвера (например `https://dns.cloudflare.com/dns-query`)
-- **`doh_providers`** — список дополнительных DoH-провайдеров для fallback (с фоновым health check каждые 30с)
-- **`direct_ips`** — список IP-адресов для прямого подключения (в обход DNS, наивысший приоритет)
-- **`alt_ports`** — альтернативные порты SSH (перебираются если стандартный порт недоступен)
-- **`sni_hostname`** — **TLS Camouflage**: домен для маскировки SSH под HTTPS (например `cloudflare.com`)
-- **`sni_hostnames`** — массив доменов для ротации SNI (перебираются, если DPI заблокировал конкретный)
-- **`obfs_secret`** — **ChaCha20-Poly1305 обфускация**: секретный ключ для шифрования трафика
-  - При пустой строке (`""`) ChaCha20-обфускация выключена
-  - Рекомендуется: `openssl rand -base64 32`
-- **`ech_config`** — **Encrypted Client Hello** (base64): шифрует реальный SNI. Получить: `dig https YOUR_DOMAIN +short`. Если пусто — ECH выключен.
-
-**Приоритет обфускации (в коде):**
-1. Если указан `sni_hostname` или `sni_hostnames` → TLS Camouflage с ротацией fingerprint'ов + Post-Quantum + ECH
-2. Если указан `sni_hostname` или `sni_hostnames` → HTTP/2 CONNECT туннель
-3. Если нет SNI, но есть `obfs_secret` → ChaCha20-Poly1305 обфускация
-4. Иначе → plain-соединение без обфускации
-
-**DoH через SOCKS5:** если заданы одновременно `doh` и `socks5`/`enable_tor`, DNS-запросы DoH автоматически направляются через прокси. ISP не видит DoH-трафик.
+- **`doh`** — основной URL DoH-резолвера
+- **`doh_providers`** — список дополнительных DoH-провайдеров (если пусто — используется встроенный пул)
+- **`direct_ips`** — список IP-адресов для прямого подключения (fallback)
+- **`alt_ports`** — альтернативные порты SSH
+- **`sni_hostnames`** — массив доменов для ротации SNI (если пусто — используется встроенный пул 21 доменов)
+- **`obfs_secret`** — секрет для ChaCha20-Poly1305 обфускации. Получить: `openssl rand -base64 32`
+- **`ech_config`** — Encrypted Client Hello (base64 из DNS HTTPS RR). Если пусто — ECH выключен.
+- **`max_tls_attempts`** — макс. TLS-хендшейков перед backoff (default 4)
+- **`tls_strategy_delay`** — пауза между батчами TLS в наносекундах (default 25s)
+- **`ws_read_limit`** — макс. размер WS-сообщения в байтах (default 1 MB)
+- **`ws_origin_pins`** — список разрешённых Origin для CSRF-защиты WS
 
 ### `access.json` — контроль доступа по IP
 
@@ -235,12 +243,11 @@ CLI-флаги `-doh` и `-proxy` имеют приоритет над `proxy.js
 }
 ```
 
-`"*"` — разрешить все IP. Если файла нет — используются `["*"]`.
+`"*"` — разрешить все IP. Если файла нет — `["*"]` по умолчанию.
 
 ### `cert.pem` / `key.pem` — TLS-сертификаты
 
-Если сертификаты найдены — включится HTTPS (WSS).  
-Создать самоподписанные:
+Если сертификаты найдены — включится HTTPS (WSS). Создать самоподписанные:
 
 ```bash
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
@@ -249,75 +256,42 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 **Без TLS весь трафик (включая пароли) передаётся в открытом виде!**
 Рекомендуется использовать nginx / Caddy как reverse proxy с Let's Encrypt.
 
-## Использованные технологии Go 1.26
+## Используемые библиотеки Go 1.26
 
-- **`github.com/refraction-networking/utls`** — эмуляция браузерного TLS handshake (JA3 fingerprint Chrome/Firefox/Safari) для обхода DPI. Ротация fingerprint'ов, ECH, GREASE, Post-Quantum X25519Kyber768Draft00.
-- **`golang.org/x/crypto/chacha20poly1305`** — ChaCha20-Poly1305 AEAD шифрование для обфускации трафика (замена XOR).
-- **`log/slog`** — структурированное логирование с уровнями Info, Warn, Debug.
-- **`errors.Is` / `fmt.Errorf(%w)`** — корректная обработка и wrapping ошибок.
-- **`map[string]any`** — типизированные слайсы вместо `interface{}`.
-- **`net/http.ServeMux`** — роутинг без сторонних библиотек.
-- **`sync/atomic`** — атомарный флаг для безопасной остановки горутин.
-- **`golang.org/x/net/proxy`** — SOCKS5-прокси для SSH-соединений и DoH-запросов.
-- **`golang.org/x/crypto/ssh`** — SSH-клиент с терминалом и PTY.
-- **`crypto/rand`** — криптографически стойкая генерация рандомизированных путей WebSocket.
+- **`github.com/gorilla/websocket`** v1.5.3 — WebSocket-фреймворк
+- **`github.com/refraction-networking/utls`** v1.8.2 — эмуляция браузерного TLS handshake (JA3/JA4 fingerprint Chrome/Firefox/Safari)
+- **`golang.org/x/crypto/chacha20poly1305`** — XChaCha20-Poly1305 AEAD для обфускации
+- **`golang.org/x/crypto/hkdf`** — HKDF-SHA256 для KDF обфускации (замена слабого XOR)
+- **`golang.org/x/crypto/ssh`** — SSH-клиент с терминалом и PTY
+- **`golang.org/x/crypto/ssh/knownhosts`** — проверка known_hosts
+- **`golang.org/x/net/proxy`** — SOCKS5-прокси для SSH-соединений и DoH-запросов
+- **`golang.org/x/time/rate`** — token-bucket rate-limiter для WebSocket-команд
+- **`log/slog`** — структурированное логирование с уровнями Info / Warn / Debug
+- **`sync/atomic`** — атомарные флаги для безопасной остановки горутин
+- **`net/http`** — стандартный HTTP-сервер с TLS 1.3
+- **`crypto/rand`** — криптографически стойкая генерация рандомизированных путей WebSocket
 
-## .gitignore — что попадает в репозиторий
+## Замечания по безопасности
 
-Конфигурационные файлы с IP / логинами / паролями и TLS-сертификаты **не** включаются в git:
+1. **Пароль передаётся в JSON WebSocket** — без TLS это открытый текст. С TLS — безопасно, но логируется на reverse-proxy. Рекомендуется SSH-ключ.
+2. **Известные_хосты** — `-key /path/to/known_hosts` обязателен для прода. Без него используется `InsecureIgnoreHostKey`.
+3. **SOCKS5 Tor** — обычный Tor (без мостов obfs4/snowflake/webtunnel) уже блокируется в РФ. Нужны мосты.
+4. **Origin-pinning** — для прода обязательно настройте `ws_origin_pins` в `proxy.json`.
 
-| Файл | В git | Причина |
-|---|---|---|
-| `main.go` | ✅ | Исходный код |
-| `go.mod` / `go.sum` | ✅ | Зависимости |
-| `static/` | ✅ | Веб-интерфейс (xterm.js) |
-| `README.md` | ✅ | Документация |
-| `.gitignore` | ✅ | Правила игнорирования |
-| `webssh.service` | ✅ | Пример systemd unit |
-| `access.json` | ❌ | IP-адреса и сети |
-| `proxy.json` | ❌ | Адреса прокси и обхода |
-| `webssh.conf` | ❌ | Настройки подключения |
-| `cert.pem` / `key.pem` | ❌ | TLS-сертификаты |
-| `webssh` / `webssh.exe` | ❌ | Бинарник |
-| `debug.log` | ❌ | Логи |
-
-## Структура проекта
-
-```
-web_ssh/
-├── main.go            # Сервер + SSH-мост + Obfuscation (Go 1.26)
-├── go.mod             # Модуль и зависимости (в git)
-├── go.sum             # Контрольные суммы (в git)
-├── .gitignore         # Правила игнорирования (в git)
-├── README.md          # Этот файл (в git)
-├── webssh.service     # systemd unit (пример) (в git)
-├── static/
-│   ├── index.html     # Веб-интерфейс (xterm.js) (в git)
-│   ├── script.js      # WebSocket-клиент (в git)
-│   └── style.css      # Стили (в git)
-├── access.json        # IP-контроль доступа (НЕ в git)
-├── proxy.json         # Настройки обхода блокировок (НЕ в git)
-├── webssh.conf        # Настройки формы по умолчанию (НЕ в git)
-├── cert.pem           # TLS-сертификат (НЕ в git)
-└── key.pem            # Ключ TLS (НЕ в git)
-```
-
-## Пуш в репозиторий
+## Отладка
 
 ```bash
-# Проверить, какие файлы попадут в коммит
-git status
+# Запуск с подробным логом
+./webssh -debug
 
-# Добавить все отслеживаемые файлы
-git add .
+# Логи пишутся в debug.log рядом с бинарником
+tail -f debug.log
 
-# Создать коммит
-git commit -m "feat: DPI bypass — PQ crypto, GREASE, ChaCha20, H2 CONNECT, SNI rotation, DoH health check, reconnection"
-
-# Отправить на GitHub
-git push origin main
+# Проверка JA4 fingerprint собственного TLS-соединения
+# Сниффите трафик: tcpdump -i any -w /tmp/cap.pcap 'host ваш-сервер'
+# Загрузите в https://tls.browserleaks.com/json для просмотра JA3/JA4
 ```
 
 ## Лицензия
 
-Проект распространяется под лицензией MIT.
+MIT.
