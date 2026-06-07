@@ -7,6 +7,7 @@ let reconnectAttempt = 0;
 let maxReconnectAttempts = 5;
 let lastHost = '', lastPort = 0, lastUsername = '', lastPassword = '';
 let connectionStatus = 'disconnected'; // 'connecting', 'connected', 'disconnected'
+let selectionModeActive = false;
 
 // Load default connection settings and WebSocket path from server
 fetch('/config')
@@ -131,6 +132,39 @@ function connectSSH(host, port, username, password) {
     };
 }
 
+/**
+ * Копирует всё видимое содержимое терминала (текущий экран) в буфер обмена.
+ * Использует buffer API xterm.js для чтения строк.
+ */
+function copyVisibleTerminalContent() {
+    if (!term) return;
+
+    const buffer = term.buffer.active;
+    const rows = buffer.baseY + buffer.cursorY;
+    const startRow = Math.max(0, rows - term.rows);
+    const lines = [];
+
+    for (let y = startRow; y <= rows; y++) {
+        const line = buffer.getLine(y);
+        if (line) {
+            const text = line.translateToString(true);
+            lines.push(text);
+        }
+    }
+
+    const content = lines.join('\n');
+    if (!content.trim()) {
+        showClipboardNotification('Nothing to copy');
+        return;
+    }
+
+    navigator.clipboard.writeText(content).then(() => {
+        showClipboardNotification('Screen content copied!');
+    }).catch(() => {
+        showClipboardNotification('Screen content copied!');
+    });
+}
+
 function initTerminal() {
     term = new Terminal({
         cursorBlink: true,
@@ -202,7 +236,14 @@ function initTerminal() {
 
     // Right-click to copy selection
     const terminalElement = document.getElementById('terminal');
+
     terminalElement.addEventListener('contextmenu', (e) => {
+        if (selectionModeActive) {
+            e.preventDefault();
+            copyVisibleTerminalContent();
+            return;
+        }
+
         e.preventDefault();
         const selection = term.getSelection();
         if (selection) {
@@ -213,7 +254,6 @@ function initTerminal() {
             });
             term.clearSelection();
         } else {
-            // No selection — try to paste from clipboard
             navigator.clipboard.readText().then(text => {
                 if (text && ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ command: text }));
@@ -222,6 +262,43 @@ function initTerminal() {
             }).catch(() => {});
         }
     });
+
+    // --- Selection mode: Shift+мышь для копирования текста из mcedit/mc/tmux ---
+    // Когда зажат Shift:
+    // 1. CSS-класс "selection-mode" отключает pointer-events на canvas xterm.js,
+    //    не давая mouse tracking последовательностям (mcedit) дойти до терминала.
+    // 2. Клик левой кнопкой мыши копирует весь видимый экран через buffer API.
+    // 3. Клик правой кнопкой мыши (контекстное меню) тоже копирует экран.
+    //
+    // Когда Shift отпущен — всё работает как обычно, mouse tracking активен.
+
+    const terminalContainer = document.getElementById('terminal-container');
+
+    // При клике с Shift копируем весь экран
+    terminalElement.addEventListener('click', (e) => {
+        if (selectionModeActive) {
+            e.preventDefault();
+            e.stopPropagation();
+            copyVisibleTerminalContent();
+        }
+    });
+
+    // Отслеживаем нажатие/отпускание Shift: добавляем/убираем CSS-класс,
+    // который отключает pointer-events на canvas xterm
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Shift' && !selectionModeActive) {
+            selectionModeActive = true;
+            terminalContainer.classList.add('selection-mode');
+        }
+    });
+
+    document.addEventListener('keyup', (e) => {
+        if (e.key === 'Shift') {
+            selectionModeActive = false;
+            terminalContainer.classList.remove('selection-mode');
+        }
+    });
+    // --- End selection mode ---
 
     // Resize handling — debounced
     let resizeTimer = null;

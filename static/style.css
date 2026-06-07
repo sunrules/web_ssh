@@ -98,6 +98,13 @@ body {
     line-height: 1.2;
 }
 
+.selection-hint {
+    font-size: 11px;
+    color: #888;
+    cursor: default;
+    user-select: none;
+}
+
 .terminal-header button {
     background: #ff4444;
     color: white;
@@ -151,6 +158,16 @@ body {
     height: 100% !important;
     width: 100% !important;
     padding: 4px;
+}
+
+/* Selection mode: при зажатом Shift отключаем pointer-events на canvas xterm.js,
+   чтобы mouse tracking (mcedit, mc, tmux) не перехватывал клики */
+#terminal-container.selection-mode .xterm canvas {
+    pointer-events: none !important;
+}
+
+#terminal-container.selection-mode .xterm .xterm-accessibility {
+    pointer-events: none !important;
 }
 
 .xterm .xterm-viewport {
