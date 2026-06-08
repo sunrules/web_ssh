@@ -294,7 +294,7 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 
 1. **Пароль передаётся в JSON WebSocket** — без TLS это открытый текст. С TLS — безопасно, но логируется на reverse-proxy. Рекомендуется SSH-ключ.
 2. **Известные_хосты** — `-key /path/to/known_hosts` обязателен для прода. Без него используется `InsecureIgnoreHostKey`.
-3. **SOCKS5 Tor** — обычный Tor (без мостов obfs4/snowflake/webtunnel) уже блокируется в РФ. Нужны мосты.
+3. **SOCKS5 Tor** — обычный Tor (без мостов obfs4/snowflake/webtunnel) уже блокируется. Нужны мосты.
 4. **Origin-pinning** — для прода обязательно настройте `ws_origin_pins` в `proxy.json`.
 
 ## Отладка
