@@ -6,7 +6,7 @@
 
 - **Полноценный SSH-терминал** в браузере через WebSocket + xterm.js (mc, vim, nano, цвета).
 - **uTLS-флис-фингерпринтов** в реальном времени: Chrome 133, Chrome 120/115 с Post-Quantum X25519Kyber768, Firefox, iOS, Edge, Safari, Randomized.
-- **DoH с расширенным пулом провайдеров** (Cloudflare, Google, Quad9, Mullvad, NextDNS, AdGuard и др.) + автоматический health-check каждые 30 с.
+- **DoH с расширенным пулом провайдеров** (Cloudflare, Google, Quad9, Mullvad, NextDNS, AdGuard, OpenDNS и др.) + автоматический health-check каждые 30 с.
 - **DoH-запросы через SOCKS5/Tor** — ISP не видит DNS-запросов.
 - **Encrypted Client Hello (ECH)** — реальный SNI шифруется внутри TLS-хендшейка.
 - **ChaCha20-Poly1305 обфускация** с KDF через **HKDF-SHA256** (криптографически стойкий).
@@ -18,6 +18,7 @@
 - **Anti-Siberia-flood защита** — лимит TLS-хендшейков (4) + backoff 25 с между батчами.
 - **SOCKS5-прокси** (Tor через `enable_tor: true`).
 - **IPv6-приоритет** — IPv6-адреса DoH резолва проверяются первыми (ТСПУ хуже фильтрует IPv6).
+- **Caching working fingerprint** — после успешного TLS-соединения fingerprint кэшируется и ставится в начало списка стратегий.
 - **Структурированное логирование** через `slog` с уровнями Info / Warn / Debug.
 - **IP-контроль доступа** — белый список IP/подсетей через `access.json`.
 - **TLS 1.2/1.3** — автоматическое включение при наличии сертификатов.
@@ -26,33 +27,51 @@
 
 ## Актуальные стратегии обхода РКН (июнь 2026)
 
-Проект использует следующие стратегии, актуальные на июнь 2026:
+Проект использует следующие стратегии подключения. Они применяются **последовательно** в порядке убывания эффективности — пока одна не сработает:
 
-### Механизмы обхода (в порядке приоритета)
+### Порядок стратегий подключения (buildStrategies)
 
-| # | Механизм | Описание | Настройка |
-|---|----------|----------|-----------|
-| 1 | **uTLS-ротация fingerprint'ов** | Chrome 133, Chrome 120_PQ, Chrome 115_PQ, Firefox, iOS, Edge, Safari, Randomized. Браузерные fingerprint'ы применяются через встроенный `UTLSIdToSpec` (НЕ через самописный ClientHelloSpec — иначе JA3/JA4 ломается). | `webssh.conf` → `[utls] client_hello` |
-| 2 | **DoH с мульти-провайдером** | 9 провайдеров + динамический health-check. При выходе провайдера из строя — исключается из ротации. | `proxy.json` → `doh_providers` |
-| 3 | **DoH через SOCKS5/Tor** | DNS-запросы DoH направляются через Tor — ISP не видит DoH-трафика. | `proxy.json` → `socks5` + `doh` |
-| 4 | **Маскированный User-Agent** | DoH-запросы используют реальный UA Chrome/Safari/Firefox/Edge вместо `Go-http-client/1.1`. | Встроено |
-| 5 | **Post-Quantum криптография** | X25519Kyber768Draft00 в Chrome 120/115 PQ. Устойчиво к квантовым атакам (для защиты данных, не от DPI). | Встроено в `HelloChrome_120_PQ`, `HelloChrome_115_PQ` |
-| 6 | **GREASE-расширения** | Добавление GREASE в ClientHello. DPI не может детектировать uTLS по отсутствию GREASE. | Встроено для custom fingerprint'ов |
-| 7 | **Encrypted Client Hello (ECH)** | Шифрует реальный SNI внутри TLS-хендшейка. DPI видит только внешний SNI (например, `www.asus.com`). | `proxy.json` → `ech_config` (base64) |
-| 8 | **TLS record padding** | После успешного TLS-хендшейка отправляется Chrome-like padding record. Скрывает реальные размеры первых пакетов. | Встроено в `paddedTLSConn` |
-| 9 | **ChaCha20-Poly1305 обфускация** | XChaCha20-Poly1305 с KDF через HKDF-SHA256. Случайный nonce на пакет. | `proxy.json` → `obfs_secret` |
-| 10 | **SOCKS5/Tor** | Маршрутизация через Tor (только через мосты obfs4/snowflake для РФ 2026). | `-proxy addr` / `proxy.json` → `socks5` |
-| 11 | **Рандомизация WebSocket пути** | Уникальный путь `/<16-hex>` при каждом запуске. | Встроено |
-| 12 | **Anti-Siberia-flood** | После 4 TLS-хендшейков — пауза 25 с. Предотвращает «Сибирскую блокировку» IP:port на 120 с. | `proxy.json` → `max_tls_attempts`, `tls_strategy_delay` |
-| 13 | **Ротация SNI hostname** | 21 актуальный на 2026 домен (www.asus.com, www.samsung.com, www.microsoft.com, www.google.com, www.apple.com и др.) — не в списках ТСПУ. | `proxy.json` → `sni_hostnames` |
-| 14 | **Прямые IP-адреса** | Fallback на заранее заданные IP. | `proxy.json` → `direct_ips` |
-| 15 | **Альтернативные порты** | Подключение по нестандартным портам (8443, 2053, 2083 и др.). | `proxy.json` → `alt_ports` |
-| 16 | **WebSocket origin pin** | Защита от CSRF — WS upgrade принимается только с указанных Origin'ов. | `proxy.json` → `ws_origin_pins` |
-| 17 | **WebSocket rate limit** | 512 KB/s, burst 1 MB на сессию. Защита от slow-rate атак. | Встроено |
+| # | Стратегия | Описание |
+|---|-----------|----------|
+| 1 | **DoH IPv6 + uTLS + SNI** 🥇 | DoH-резолв → IPv6 приоритет → uTLS Chrome 133 → SNI на CDN-донор. IPv6-трафик хуже фильтруется ТСПУ. |
+| 2 | **DoH IPv4 + uTLS + SNI** | То же для IPv4-адресов. |
+| 3 | **DoH IP + ChaCha20** | Обфускация XChaCha20-Poly1305 через HKDF-SHA256 (не требует SNI). |
+| 4 | **Original host + uTLS + SNI** | Прямое разрешение DNS + uTLS + SNI-маскировка. |
+| 5 | **Original host + ChaCha20** | Прямое разрешение + ChaCha20-обфускация. |
+| 6 | **Original host (plain SSH)** | Обычный SSH без обфускации (если блокировок нет). |
+| 7 | **Direct IPs** | Fallback на заранее заданные IP-адреса. |
+| 8 | **Alt ports + ChaCha20 / plain** | Подключение по нестандартным TCP-портам с/без обфускации. |
+
+### Механизмы обфускации внутри стратегий
+
+| Механизм | Описание | Настройка |
+|----------|----------|-----------|
+| **uTLS-ротация fingerprint'ов** | Chrome 133, Chrome 120_PQ, Chrome 115_PQ, Firefox, iOS, Edge, Safari, Randomized. Браузерные fingerprint'ы применяются через встроенный `UTLSIdToSpec` (НЕ через самописный ClientHelloSpec — иначе JA3/JA4 ломается). | `webssh.conf` → `[utls] client_hello` |
+| **DoH с мульти-провайдером** | 9 провайдеров + динамический health-check. При выходе провайдера из строя — исключается из ротации. | `proxy.json` → `doh_providers` |
+| **DoH через SOCKS5/Tor** | DNS-запросы DoH направляются через Tor — ISP не видит DoH-трафика. | `proxy.json` → `socks5` + `doh` |
+| **Маскированный User-Agent** | DoH-запросы используют реальный UA Chrome/Safari/Firefox/Edge вместо `Go-http-client/1.1`. | Встроено |
+| **Post-Quantum криптография** | X25519Kyber768Draft00 в Chrome 120/115 PQ. Устойчиво к квантовым атакам (для защиты данных, не от DPI). | Встроено в `HelloChrome_120_PQ`, `HelloChrome_115_PQ` |
+| **GREASE-расширения** | Добавление GREASE в ClientHello. DPI не может детектировать uTLS по отсутствию GREASE. | Встроено для custom fingerprint'ов |
+| **Encrypted Client Hello (ECH)** | Шифрует реальный SNI внутри TLS-хендшейка. DPI видит только внешний SNI (например, `www.asus.com`). | `proxy.json` → `ech_config` (base64) |
+| **TLS record padding** | После успешного TLS-хендшейка отправляется Chrome-like padding record. Скрывает реальные размеры первых пакетов. | Встроено в `paddedTLSConn` |
+| **ChaCha20-Poly1305 обфускация** | XChaCha20-Poly1305 с KDF через HKDF-SHA256. Случайный nonce на пакет. | `proxy.json` → `obfs_secret` |
+| **SOCKS5/Tor** | Маршрутизация через Tor (только через мосты obfs4/snowflake для РФ 2026). | `-proxy addr` / `proxy.json` → `socks5` |
+| **Anti-Siberia-flood** | После 4 TLS-хендшейков — пауза 25 с. Предотвращает «Сибирскую блокировку» IP:port на 120 с. | `proxy.json` → `max_tls_attempts`, `tls_strategy_delay` |
+| **Ротация SNI hostname** | 21 актуальный на 2026 домен (www.asus.com, www.samsung.com, www.microsoft.com, www.google.com, www.apple.com и др.) — не в списках ТСПУ. | `proxy.json` → `sni_hostnames` |
+| **Рандомизация WebSocket пути** | Уникальный путь `/<16-hex>` при каждом запуске. | Встроено |
+| **WebSocket origin pin** | Защита от CSRF — WS upgrade принимается только с указанных Origin'ов. | `proxy.json` → `ws_origin_pins` |
+| **WebSocket rate limit** | 512 KB/s, burst 1 MB на сессию. Защита от slow-rate атак. | Встроено |
+
+### Кэширование рабочего fingerprint'a
+
+После успешного uTLS-соединения fingerprint кэшируется (`workingFingerprint`, строка 588-596):
+- При следующих попытках он вставляется в начало списка стратегий
+- Это ускоряет повторные подключения к тому же хосту
+- Сброс происходит только при перезапуске webssh
 
 ### Что НЕ реализовано (и почему)
 
-- **QUIC-туннель через `quic-go`** — реальный QUIC требует двусторонней поддержки (на сервере должен быть QUIC-туннель, на клиенте — QUIC-клиент). Поскольку целевой сервис — это обычный `sshd` на TCP, нативный QUIC не применяется. Вместо этого — UDP-обёртка отключена.
+- **QUIC-туннель** — флаг `-quic` присутствует в CLI для совместимости, но реальный QUIC требует двусторонней поддержки на сервере (должен быть QUIC-туннель, а целевой сервис — это обычный `sshd` на TCP). Активная UDP-обёртка отключена.
 - **HTTP/2 CONNECT туннель** — был в исходном коде, но фактически использовал `tls.Client` (Go-фолбэк) и не работал с обычным sshd. Удалён.
 - **Серверные стратегии (VLESS-Reality, AmneziaWG)** — выходят за рамки WebSSH. Рекомендуется поднимать их **отдельным процессом** перед sshd.
 
@@ -78,7 +97,7 @@ WebSSH — это **web-интерфейс** для SSH. Для реальног
 # Сборка (Go 1.26+)
 go build -o webssh -ldflags "-s -w" .
 
-# Запуск на порту 3400
+# Запуск на порту 3400 (использует proxy.json если есть)
 ./webssh
 
 # С DoH и SOCKS5
@@ -192,8 +211,8 @@ client_hello = HelloChrome_133
     "https://dns.electrolab.ru/dns-query",
     "https://doh.opendns.com/dns-query"
   ],
-  "direct_ips": ["198.51.100.1"],
-  "alt_ports": [8443, 2053, 2083, 2096, 2222],
+  "direct_ips": [],
+  "alt_ports": [],
   "sni_hostnames": [
     "www.asus.com",
     "www.samsung.com",
@@ -209,16 +228,16 @@ client_hello = HelloChrome_133
   "tls_strategy_delay": 25000000000,
 
   "ws_read_limit": 1048576,
-  "ws_origin_pins": ["https://ваш-домен.ru"]
+  "ws_origin_pins": []
 }
 ```
 
 **Параметры обхода блокировок:**
 
 - **`socks5`** — адрес SOCKS5-прокси (например `127.0.0.1:9050` для Tor)
-- **`enable_tor`** — автоматическая настройка SOCKS5 на `127.0.0.1:9050` если прокси не задан явно
+- **`enable_tor`** — автоматическая настройка SOCKS5 на `127.0.0.1:9050` если прокси не задан явно (если socks5 уже задан — не перезаписывает)
 - **`doh`** — основной URL DoH-резолвера
-- **`doh_providers`** — список дополнительных DoH-провайдеров (если пусто — используется встроенный пул)
+- **`doh_providers`** — список дополнительных DoH-провайдеров (если пусто — используется встроенный пул из 9 провайдеров)
 - **`direct_ips`** — список IP-адресов для прямого подключения (fallback)
 - **`alt_ports`** — альтернативные порты SSH
 - **`sni_hostnames`** — массив доменов для ротации SNI (если пусто — используется встроенный пул 21 доменов)
@@ -227,7 +246,7 @@ client_hello = HelloChrome_133
 - **`max_tls_attempts`** — макс. TLS-хендшейков перед backoff (default 4)
 - **`tls_strategy_delay`** — пауза между батчами TLS в наносекундах (default 25s)
 - **`ws_read_limit`** — макс. размер WS-сообщения в байтах (default 1 MB)
-- **`ws_origin_pins`** — список разрешённых Origin для CSRF-защиты WS
+- **`ws_origin_pins`** — список разрешённых Origin для CSRF-защиты WS. Если пусто — любой Origin разрешён.
 
 ### `access.json` — контроль доступа по IP
 
