@@ -1,6 +1,6 @@
 # WebSSH — Web-терминал для SSH через браузер
 
-**WebSSH** — это веб-приложение на Go 1.26.3, которое предоставляет терминал SSH прямо в браузере через WebSocket. Разработано для безопасного удалённого управления серверами в условиях сетевых ограничений.
+**WebSSH** — это веб-приложение на Go 1.27.1, которое предоставляет терминал SSH прямо в браузере через WebSocket. Разработано для безопасного удалённого управления серверами в условиях сетевых ограничений.
 
 ## Возможности
 
@@ -10,7 +10,7 @@
 - **DoH-запросы через SOCKS5/Tor** — ISP не видит DNS-запросов.
 - **Encrypted Client Hello (ECH)** — реальный SNI шифруется внутри TLS-хендшейка.
 - **ChaCha20-Poly1305 обфускация** с KDF через **HKDF-SHA256** (криптографически стойкий).
-- **TLS record padding** после хендшейка (имитация поведения Chrome).
+- **TLS record padding** — настоящий record-padding (RFC 8446 §5.4) на уровне application-data не контролируется через uTLS; он обеспечивается TLS-терминатором (stunnel/nginx/HAProxy), а не самим webssh.
 - **GREASE-расширения** в ClientHello для противодействия uTLS-детекту.
 - **Post-Quantum X25519Kyber768Draft00** — устойчивость к квантовым атакам.
 - **Рандомизированный WebSocket endpoint path** — `/<random_hex>` генерируется при старте.
@@ -53,7 +53,7 @@
 | **Post-Quantum криптография** | X25519Kyber768Draft00 в Chrome 120/115 PQ. Устойчиво к квантовым атакам (для защиты данных, не от DPI). | Встроено в `HelloChrome_120_PQ`, `HelloChrome_115_PQ` |
 | **GREASE-расширения** | Добавление GREASE в ClientHello. DPI не может детектировать uTLS по отсутствию GREASE. | Встроено для custom fingerprint'ов |
 | **Encrypted Client Hello (ECH)** | Шифрует реальный SNI внутри TLS-хендшейка. DPI видит только внешний SNI (например, `www.asus.com`). | `proxy.json` → `ech_config` (base64) |
-| **TLS record padding** | После успешного TLS-хендшейка отправляется Chrome-like padding record. Скрывает реальные размеры первых пакетов. | Встроено в `paddedTLSConn` |
+| **TLS record padding** | Настоящий record-padding (RFC 8446 §5.4) на уровне application-data через uTLS не контролируется (внедрение padding-байт внутрь шифротекста ломает SSH-баннер). Должен обеспечиваться TLS-терминатором (stunnel/nginx/HAProxy). | TLS-терминатор |
 | **ChaCha20-Poly1305 обфускация** | XChaCha20-Poly1305 с KDF через HKDF-SHA256. Случайный nonce на пакет. | `proxy.json` → `obfs_secret` |
 | **SOCKS5/Tor** | Маршрутизация через Tor (только через мосты obfs4/snowflake для РФ 2026). | `-proxy addr` / `proxy.json` → `socks5` |
 | **Anti-Siberia-flood** | После 4 TLS-хендшейков — пауза 25 с. Предотвращает «Сибирскую блокировку» IP:port на 120 с. | `proxy.json` → `max_tls_attempts`, `tls_strategy_delay` |
@@ -64,14 +64,14 @@
 
 ### Кэширование рабочего fingerprint'a
 
-После успешного uTLS-соединения fingerprint кэшируется (`workingFingerprint`, строка 588-596):
+После успешного uTLS-соединения fingerprint кэшируется (`workingFingerprint`, строка 628):
 - При следующих попытках он вставляется в начало списка стратегий
 - Это ускоряет повторные подключения к тому же хосту
 - Сброс происходит только при перезапуске webssh
 
 ### Что НЕ реализовано (и почему)
 
-- **QUIC-туннель** — флаг `-quic` присутствует в CLI для совместимости, но реальный QUIC требует двусторонней поддержки на сервере (должен быть QUIC-туннель, а целевой сервис — это обычный `sshd` на TCP). Активная UDP-обёртка отключена.
+- **QUIC-туннель** — полностью удалён из кода (поля `EnableQUIC`/`AltPortsUDP` и флаг `-quic`). Реальный QUIC требует двусторонней поддержки на сервере (должен быть QUIC-туннель, а целевой сервис — это обычный `sshd` на TCP). Активная UDP-обёртка отключена.
 - **HTTP/2 CONNECT туннель** — был в исходном коде, но фактически использовал `tls.Client` (Go-фолбэк) и не работал с обычным sshd. Удалён.
 - **Серверные стратегии (VLESS-Reality, AmneziaWG)** — выходят за рамки WebSSH. Рекомендуется поднимать их **отдельным процессом** перед sshd.
 
@@ -94,7 +94,7 @@ WebSSH — это **web-интерфейс** для SSH.
 ## Быстрый старт
 
 ```bash
-# Сборка (Go 1.26+)
+# Сборка (Go 1.27+)
 go build -o webssh -ldflags "-s -w" .
 
 # Запуск на порту 3400 (использует proxy.json если есть)
@@ -118,7 +118,7 @@ go build -o webssh -ldflags "-s -w" .
 
 ### Требования
 
-- Go 1.26+
+- Go 1.27.1+
 - Доступ в интернет для скачивания зависимостей
 
 ### Сборка
@@ -179,7 +179,7 @@ port = 2222
 # uTLS Client Hello fingerprint (браузерная эмуляция для обхода DPI).
 # Доступные варианты:
 #   HelloChrome_Auto    — автоматический выбор актуальной версии Chrome
-#   HelloChrome_133     — Chrome 133 (стабильная, рекомендуется)
+#   HelloChrome_133     — Chrome 133 (стабильная; встроенный дефолт — HelloChrome_Auto)
 #   HelloChrome_120     — Chrome 120
 #   HelloChrome_120_PQ  — Chrome 120 + Post-Quantum X25519Kyber768
 #   HelloChrome_115_PQ  — Chrome 115 + Post-Quantum X25519Kyber768
@@ -188,7 +188,6 @@ port = 2222
 #   HelloSafari_Auto    — Safari
 #   HelloIOS_Auto       — iOS Safari
 #   HelloRandomized     — случайный fingerprint (экспериментально)
-#   HelloGolang         — стандартный Go fingerprint (без обфускации)
 [utls]
 client_hello = HelloChrome_133
 ```
@@ -275,7 +274,7 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 **Без TLS весь трафик (включая пароли) передаётся в открытом виде!**
 Рекомендуется использовать nginx / Caddy как reverse proxy с Let's Encrypt.
 
-## Используемые библиотеки Go 1.26
+## Используемые библиотеки Go 1.27.1
 
 - **`github.com/gorilla/websocket`** v1.5.3 — WebSocket-фреймворк
 - **`github.com/refraction-networking/utls`** v1.8.2 — эмуляция браузерного TLS handshake (JA3/JA4 fingerprint Chrome/Firefox/Safari)
@@ -293,7 +292,7 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 ## Замечания по безопасности
 
 1. **Пароль передаётся в JSON WebSocket** — без TLS это открытый текст. С TLS — безопасно, но логируется на reverse-proxy. Рекомендуется SSH-ключ.
-2. **Известные_хосты** — `-key /path/to/known_hosts` обязателен для прода. Без него используется `InsecureIgnoreHostKey`.
+2. **known_hosts** — `-key /path/to/known_hosts` обязателен для прода. Без него используется `InsecureIgnoreHostKey`.
 3. **SOCKS5 Tor** — обычный Tor (без мостов obfs4/snowflake/webtunnel) уже блокируется. Нужны мосты.
 4. **Origin-pinning** — для прода обязательно настройте `ws_origin_pins` в `proxy.json`.
 
